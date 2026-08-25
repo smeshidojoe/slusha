@@ -1,0 +1,40 @@
+# Слюша: свой образ, своя база, свой контейнер.
+# Запуск отсюда:  docker compose up -d --build
+services:
+  slusha:
+    build: .
+    container_name: slusha
+    restart: unless-stopped
+
+    # .env лежит рядом. Он же монтируется внутрь: правки токена и модели
+    # подхватываются перезапуском, без пересборки образа
+    env_file: .env
+
+    environment:
+      SLUSHA_DB_PATH: /app/data/slusha.sqlite3
+      SLUSHA_LOG_PATH: /app/data/slusha.log
+      # внутри контейнера слушаем все адреса — наружу пускает только ports выше
+      SLUSHA_WEB_HOST: 0.0.0.0
+
+    # чтобы контейнер видел локальную Ollama на хосте
+    # (AI_BASE_URL=http://host.docker.internal:11434)
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+    # Панель по умолчанию выключена (SLUSHA_WEB в .env). Порт наружу отдаём
+    # только на локальный адрес: в интернет его выводит туннель, а не docker.
+    ports:
+      - "127.0.0.1:8082:8082"
+
+    volumes:
+      - ./.env:/app/slusha/.env:ro   # только чтение: контейнер его не меняет
+      - ./data:/app/data             # база и лог живут рядом с ботом
+
+    mem_limit: 4g
+    memswap_limit: 4g
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

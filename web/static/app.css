@@ -1,0 +1,64 @@
+/* Цвета берём у Telegram: панель должна выглядеть частью клиента,
+   а не чужой страницей внутри него. Значения по умолчанию — на случай,
+   если панель открыли обычным браузером мимо мини-приложения. */
+:root {
+  --bg: var(--tg-theme-bg-color, #17212b);
+  --card: var(--tg-theme-secondary-bg-color, #232e3c);
+  --fg: var(--tg-theme-text-color, #f5f5f5);
+  --muted: var(--tg-theme-hint-color, #8b9aa8);
+  --accent: var(--tg-theme-button-color, #5288c1);
+  --accent-fg: var(--tg-theme-button-text-color, #fff);
+  --danger: #d2495b;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  padding: 12px 12px 40px;
+  background: var(--bg);
+  color: var(--fg);
+  font: 15px/1.45 -apple-system, "Segoe UI", Roboto, sans-serif;
+}
+
+h1 { font-size: 19px; margin: 4px 0 12px; }
+h2 { font-size: 16px; margin: 18px 0 8px; }
+
+.muted { color: var(--muted); font-size: 13px; }
+.card { background: var(--card); border-radius: 12px; padding: 12px; margin-bottom: 10px; }
+.row { display: flex; align-items: center; gap: 10px; justify-content: space-between; }
+.row + .row { margin-top: 10px; }
+.grow { flex: 1; min-width: 0; }
+
+button {
+  font: inherit;
+  border: 0;
+  border-radius: 9px;
+  padding: 8px 12px;
+  background: var(--accent);
+  color: var(--accent-fg);
+  cursor: pointer;
+}
+button.ghost { background: transparent; color: var(--accent); padding: 6px 8px; }
+button.danger { background: var(--danger); color: #fff; }
+button:disabled { opacity: .5; cursor: default; }
+
+.chat-btn {
+  display: block; width: 100%; text-align: left; margin-bottom: 8px;
+  background: var(--card); color: var(--fg);
+}
+
+textarea, input[type=text] {
+  width: 100%; font: inherit; color: var(--fg);
+  background: var(--bg); border: 1px solid var(--muted);
+  border-radius: 9px; padding: 8px; resize: vertical;
+}
+textarea { min-height: 120px; }
+
+.pill { background: var(--bg); border-radius: 8px; padding: 2px 8px; font-size: 13px; }
+.lore-item { border-top: 1px solid rgba(139,154,168,.25); padding-top: 8px; margin-top: 8px; }
+.lore-item:first-child { border-top: 0; margin-top: 0; padding-top: 0; }
+.keys { font-weight: 600; }
+.err { color: var(--danger); }
+.ok { color: #4caf50; }
+pre.notes { white-space: pre-wrap; font: inherit; color: var(--muted); margin: 0; }
