@@ -153,7 +153,11 @@ async function screenChat(cid) {
   // ---- заметки ----
   app.append(el(`<h2>🧠 Заметки о чате</h2>`));
   const notes = el(`<div class="card"></div>`);
-  notes.append(el(`<p class="muted">Новых сообщений с прошлой пересборки: ${d.notes_pending}</p>`));
+  const when = d.notes_updated
+    ? new Date(d.notes_updated * 1000).toLocaleString('ru-RU',
+        {day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit'})
+    : 'ни разу';
+  notes.append(el(`<p class="muted">Обновлено: ${when} · новых сообщений с прошлой пересборки: ${d.notes_pending} · потолок ${d.notes_limit} знаков</p>`));
   notes.append(el(`<pre class="notes">${esc(d.notes || 'Пока пусто.')}</pre>`));
   if (d.notes) {
     const clr = el(`<button class="danger">Очистить заметки</button>`);

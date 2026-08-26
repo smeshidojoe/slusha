@@ -145,6 +145,10 @@ async def main():
     check("заметки собрались сами", bool(text))
     check("covered_id дошёл до последней реплики", covered > 0)
     check("модель просили именно пересказать", "заметки" in ASKED[-1][0].lower())
+    check("каркас разделов задан",
+          all(name in ASKED[-1][0] for name in summary._SECTIONS))
+    check("markdown запрещён явно", "markdown" in ASKED[-1][0].lower())
+    check("мёртвые строки запрещены явно", "не упоминался" in ASKED[-1][0])
     check("в пересказ уехали реплики чата", "реплика 3" in ASKED[-1][1])
 
     block = await summary.block(CID)
@@ -160,6 +164,21 @@ async def main():
     check("старое второй раз не пересказываем", "реплика 3" not in ASKED[-1][1])
     check("а новое — пересказываем", "свежак 3" in ASKED[-1][1])
 
+    # --- 4b. перезапуск не теряет накопленное ---
+    # Ровно та беда, из-за которой в живом чате висело 203 несжатых реплики
+    # при пороге в 80: счётчик жил только в памяти, бот перезапускался чаще,
+    # чем чат набирал порог, и заметки не собирались никогда.
+    await ai.forget(CID)
+    ASKED.clear()
+    for i in range(config.AI_SUMMARY_EVERY * 3):
+        await store.add(CID, "@vasya", f"накопилось {i}", 4000 + i)
+    summary._pending.clear()                  # как будто процесс перезапустили
+    summary._counted.clear()
+    check("после перезапуска счётчик пуст", not summary._pending)
+    await ai.remember(CID, "@petya", "первое сообщение после рестарта", 4999)
+    check("накопленное подхватили из базы", await settle(lambda: bool(ASKED)))
+    check("и пересказали именно его", "накопилось 5" in ASKED[-1][1])
+
     # --- 5. флаг «уже сжимаю» ---
     summary._busy.add(CID)
     ASKED.clear()
@@ -168,6 +187,21 @@ async def main():
     await settle(lambda: bool(ASKED), 30)
     check("пока идёт пересборка, вторую не запускаем", not ASKED)
     summary._busy.discard(CID)
+
+    # --- 5b. сорвавшийся запрос не роняет счётчик в минус ---
+    async def broken(system, question, tokens=0, images=None):
+        raise RuntimeError("модель недоступна")
+
+    await ai.forget(CID)
+    summary._counted.add(CID)                 # чат уже сверен, считаем от нуля
+    ai._ask_ollama = broken
+    for i in range(config.AI_SUMMARY_EVERY):
+        await ai.remember(CID, "@vasya", f"сорвётся {i}", 5000 + i)
+    await settle(lambda: CID not in summary._busy)
+    check("после неудачи заметок нет", (await store.summary_get(CID))[0] == "")
+    check("и счётчик сброшен, чтобы не дёргать модель каждым сообщением",
+          summary._pending.get(CID, 0) == 0)
+    ai._ask_ollama = fake_model
 
     # --- 6. слишком длинные заметки режутся ---
     async def verbose(system, question, tokens=0, images=None):

@@ -92,6 +92,8 @@ async def chat(request: web.Request) -> web.Response:
         "capped": ai.capped(),
         "notes": notes,
         "notes_pending": await store.pending(cid, covered),
+        "notes_updated": await store.summary_updated(cid),
+        "notes_limit": config.AI_SUMMARY_LIMIT,
         "lore": [dict(r) for r in await db.lore_list(cid)],
     })
 

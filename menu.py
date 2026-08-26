@@ -173,14 +173,17 @@ async def view_notes(cid: int) -> tuple[str, InlineKeyboardMarkup]:
     """Что бот запомнил о чате сверх окна контекста."""
     text, covered = await store.summary_get(cid)
     left = await store.pending(cid, covered)
+    when = await store.summary_updated(cid)
     lines = [
         "<b>🧠 Заметки о чате</b>\n",
         "Окно контекста помнит только последние сообщения. Всё, что уехало "
         "за его край, бот время от времени пересказывает себе сюда: кто есть "
         "кто, о чём договорились, какие шутки прижились. Заметки уходят в "
         "каждый запрос как справка.\n",
+        (f"Обновлено: <b>{utils.stamp(when)}</b>\n" if when else ""),
         f"Новых сообщений с прошлой пересборки: <b>{left}</b> "
-        f"(пересобирает каждые {config.AI_SUMMARY_EVERY}).\n",
+        f"(пересобирает каждые {config.AI_SUMMARY_EVERY}, потолок заметок — "
+        f"{config.AI_SUMMARY_LIMIT} знаков).\n",
     ]
     lines.append(f"<i>{utils.esc(text)}</i>" if text.strip()
                  else "Пока пусто — бот ещё не набрал материала.")

@@ -222,6 +222,15 @@ async def summary_get(chat_id: int) -> tuple[str, int]:
     return (row["text"], row["covered_id"]) if row else ("", 0)
 
 
+async def summary_updated(chat_id: int) -> int:
+    """Когда заметки пересобирали в последний раз. 0 — ни разу."""
+    db = await _conn()
+    cur = await db.execute("SELECT updated_at FROM ai_summary WHERE chat_id = ?",
+                           (chat_id,))
+    row = await cur.fetchone()
+    return row["updated_at"] if row else 0
+
+
 async def summary_set(chat_id: int, text: str, covered_id: int) -> None:
     db = await _conn()
     await db.execute(

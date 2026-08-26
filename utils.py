@@ -20,6 +20,11 @@ def day_num(ts: float | None = None) -> int:
     return dt.toordinal()
 
 
+def stamp(ts: int | float) -> str:
+    """Метка времени для меню и панели, в часовом поясе бота."""
+    return datetime.fromtimestamp(ts, _tz()).strftime("%d.%m %H:%M")
+
+
 def msg_gone(e: Exception) -> bool:
     """Ошибка «сообщения больше нет» — на такое ругаться в лог не стоит."""
     text = str(e).lower()
