@@ -47,8 +47,9 @@ def msg(uid, uname, text, reply=None):
         text=text, caption=None, message_id=uid, reply_to_message=reply)
 
 
-async def fake_ollama(system, question, tokens=0, images=None):
-    SENT.append((system, question, tokens, images))
+async def fake_ollama(system, messages, tokens=0, images=None):
+    # переписка теперь едет ходами диалога; для проверок склеиваем обратно
+    SENT.append((system, ai.flatten(messages), tokens, images))
     return "ответ бота"
 
 
@@ -119,8 +120,10 @@ async def main():
 
     snap2 = await ai.history(CID, s.ai_ctx)
     await ai.ask(s, "Овощехранилище", CID, "@kolya", "и?", ["@slusha_bot"], snapshot=snap2)
-    check("в промпте свои реплики от «ты»", "ты: ответ бота" in SENT[-1][1])
-    check("юзернейма бота в переписке нет", "@slusha_bot: ответ бота" not in SENT[-1][1])
+    check("свои реплики идут ходом assistant",
+          "assistant: ответ бота" in SENT[-1][1])
+    check("юзернейма бота в переписке нет",
+          "@slusha_bot: ответ бота" not in SENT[-1][1])
 
     # --- 6. окно контекста ---
     check("num_ctx поднят до 16384", config.AI_NUM_CTX == 16384)

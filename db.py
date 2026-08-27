@@ -30,15 +30,18 @@ CREATE TABLE IF NOT EXISTS settings(
     ai_on       INTEGER NOT NULL DEFAULT 0,
     ai_persona  TEXT,
     ai_random   INTEGER NOT NULL DEFAULT 3,
-    ai_ctx      INTEGER NOT NULL DEFAULT 50,
+    ai_ctx      INTEGER NOT NULL DEFAULT 30,
     ai_daily    INTEGER NOT NULL DEFAULT 100,
     ai_names    TEXT,
     ai_free     INTEGER NOT NULL DEFAULT 0,
     ai_len      INTEGER NOT NULL DEFAULT 1,
+    ai_reply    INTEGER NOT NULL DEFAULT 35,
     ai_lang     INTEGER NOT NULL DEFAULT 1,
     ai_vision   INTEGER NOT NULL DEFAULT 0,
     ai_topics   INTEGER NOT NULL DEFAULT 0,
-    ai_greeting TEXT
+    ai_greeting TEXT,
+    ai_examples TEXT,
+    ai_lore_bg  INTEGER NOT NULL DEFAULT 1
 );
 CREATE TABLE IF NOT EXISTS lore(
     id       INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -75,15 +78,18 @@ class Settings:
     ai_on: int = 0
     ai_persona: str | None = None
     ai_random: int = 3
-    ai_ctx: int = 50
+    ai_ctx: int = config.AI_CTX_DEFAULT
     ai_daily: int = 100
     ai_names: str | None = None
     ai_free: int = 0
     ai_len: int = 1
+    ai_reply: int = 35
     ai_lang: int = 1
     ai_vision: int = 0
     ai_topics: int = 0
     ai_greeting: str | None = None
+    ai_examples: str | None = None
+    ai_lore_bg: int = 1
 
 
 _FIELDS = {f.name for f in fields(Settings)} - {"chat_id"}
@@ -125,10 +131,13 @@ async def _migrate() -> None:
     """Разовые правки старых баз. Флаг в kv, чтобы не повторялись при каждом старте."""
     # Новые настройки чата. Проверка по PRAGMA, а не по флагу: так миграция
     # безразлична к тому, с какой версии база приехала и что уже накатывали.
-    for name, decl in (("ai_lang", "INTEGER NOT NULL DEFAULT 1"),
+    for name, decl in (("ai_reply", "INTEGER NOT NULL DEFAULT 35"),
+                       ("ai_lang", "INTEGER NOT NULL DEFAULT 1"),
                        ("ai_vision", "INTEGER NOT NULL DEFAULT 0"),
                        ("ai_topics", "INTEGER NOT NULL DEFAULT 0"),
-                       ("ai_greeting", "TEXT")):
+                       ("ai_greeting", "TEXT"),
+                       ("ai_examples", "TEXT"),
+                       ("ai_lore_bg", "INTEGER NOT NULL DEFAULT 1")):
         await _add_column("settings", name, decl)
     await _db.commit()
 

@@ -122,8 +122,13 @@ async function screenChat(cid) {
   area.value = d.persona;
   persona.append(area);
   const saveRow = el(`<div class="row"></div>`);
-  const counter = el(`<span class="muted grow">${d.persona.length} знаков</span>`);
-  area.oninput = () => { counter.textContent = area.value.length + ' знаков'; };
+  // характер уезжает в модель на каждый запрос и делит окно с историей:
+  // на пяти тысячах знаков вопрос собеседника в нём тонет
+  const hint = n => n > d.persona_soft
+    ? `${n} знаков — многовато, рабочий размер до ${d.persona_soft}`
+    : `${n} знаков`;
+  const counter = el(`<span class="muted grow">${hint(d.persona.length)}</span>`);
+  area.oninput = () => { counter.textContent = hint(area.value.length); };
   const save = el(`<button>Сохранить</button>`);
   save.onclick = async () => {
     try {
@@ -134,6 +139,21 @@ async function screenChat(cid) {
   saveRow.append(counter, save);
   persona.append(saveRow);
   app.append(persona);
+
+  // ---- примеры реплик ----
+  app.append(el(`<h2>💬 Примеры реплик</h2>`));
+  const exBox = el(`<div class="card"></div>`);
+  exBox.append(el(`<p class="muted">Как персонаж разговаривает — по строке на реплику, «ты:» и «собеседник:». Уходят в начало переписки образцом манеры; на небольших моделях действуют сильнее, чем описание словами.</p>`));
+  const exArea = el(`<textarea placeholder="собеседник: почём яблоки?&#10;ты: дороже, чем вчера."></textarea>`);
+  exArea.value = d.examples;
+  exBox.append(exArea);
+  const exSave = el(`<button>Сохранить</button>`);
+  exSave.onclick = async () => {
+    try { await api(`/api/chat/${cid}/examples`, {method: 'POST', body: {text: exArea.value}}); reload(); }
+    catch (e) { fail(e); }
+  };
+  row(exBox, exSave);
+  app.append(exBox);
 
   // ---- имена-обращения ----
   app.append(el(`<h2>🔔 Имена-обращения</h2>`));

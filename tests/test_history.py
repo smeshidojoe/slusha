@@ -52,8 +52,8 @@ def msg(text=None, caption=None, **media):
     return SimpleNamespace(**base)
 
 
-async def fake_ollama(system, question):
-    SENT.append(question)
+async def fake_ollama(system, messages, tokens=0, images=None):
+    SENT.append(messages)
     return "ответ"
 
 
@@ -65,7 +65,10 @@ async def main():
     await db.upsert_chat(CID, "Чат", None, 424211817)
     await db.set_setting(CID, "ai_on", 1)
     s = await db.get_settings(CID)
-    check("окно контекста по умолчанию 50", s.ai_ctx == 50)
+    check("окно контекста по умолчанию как в config",
+          s.ai_ctx == config.AI_CTX_DEFAULT)
+    check("и это не полсотни: небольшая модель столько уже размазывает",
+          config.AI_CTX_DEFAULT <= 30)
     check("буфер памяти не меньше самого большого окна",
           config.AI_HISTORY >= max(config.AI_CTX_PRESETS))
 

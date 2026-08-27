@@ -194,6 +194,43 @@ def clean_markup(text: str) -> str:
     return text.strip()
 
 
+# Примеры диалога в карточках лежат одним куском, где обмены разделены
+# маркером <START>, а говорящий подписан плейсхолдером: «{{char}}: …» —
+# это герой, «{{user}}: …» — собеседник. Плейсхолдеры к этому моменту уже
+# подставлены _fill(), поэтому ловим и то, и другое написание.
+_EX_SPLIT = re.compile(r"<\s*START\s*>", re.IGNORECASE)
+
+
+def parse_examples(raw: str, name: str) -> str:
+    """mes_example карточки — в строки «ты: …» и «собеседник: …».
+
+    Самое ценное, что есть в карточке для маленькой модели, и до сих пор мы
+    это поле просто выбрасывали: показанная манера речи задаёт стиль сильнее,
+    чем любое её описание словами.
+    """
+    if not raw:
+        return ""
+    who_self = re.escape(name) if name else "char"
+    out = []
+    for chunk in _EX_SPLIT.split(clean_markup(raw)):
+        for row in chunk.split("\n"):
+            row = row.strip()
+            speaker, sep, text = row.partition(":")
+            if not sep or not text.strip():
+                continue
+            speaker = speaker.strip().strip("*_ ")
+            # «ты» — потому что _fill() подставляет его вместо {{char}},
+            # когда имя героя в карточке не указано
+            if re.fullmatch(rf"{who_self}|ты|\{{\{{char\}}\}}|char|bot", speaker,
+                            re.IGNORECASE):
+                out.append(f"ты: {text.strip()}")
+            elif re.fullmatch(r"собеседник|\{\{user\}\}|user|you|human", speaker,
+                              re.IGNORECASE):
+                out.append(f"собеседник: {text.strip()}")
+            # чужие подписи пропускаем: в карточках бывают ремарки и заголовки
+    return "\n".join(out)
+
+
 def parse_card(data: dict) -> dict:
     """Описание персонажа из карточки. Пустые поля просто не заполнены."""
     if not isinstance(data, dict):
@@ -204,10 +241,12 @@ def parse_card(data: dict) -> dict:
     persona = "\n\n".join(p.strip() for p in parts if isinstance(p, str) and p.strip())
     persona = _fill(clean_markup(persona), name)
     greeting = _fill(clean_markup((d.get("first_mes") or "").strip()), name)
+    examples = parse_examples(_fill(d.get("mes_example") or "", name), name)
     return {
         "name": name,
         "persona": _trim(persona, PERSONA_LIMIT),
         "greeting": _trim(greeting, 1000),
+        "examples": examples[:config.AI_EXAMPLE_LIMIT],
     }
 
 
@@ -229,19 +268,38 @@ def _hits(entry, text: str) -> bool:
     return False
 
 
-async def block(chat_id: int, text: str) -> str:
-    """Кусок промпта со сработавшими записями. Пусто — книги нет или молчит."""
+async def block(chat_id: int, text: str, background: bool = True) -> str:
+    """Кусок промпта со сработавшими записями. Пусто — книги нет или молчит.
+
+    background — подмешивать ли кусок книги, когда не совпало ничего.
+    """
     rows = await db.lore_list(chat_id, only_enabled=True)
     if not rows:
         return ""
-    picked = [r for r in rows if r["always"] or _hits(r, text)]
-    picked.sort(key=lambda r: r["prio"])
+    # Совпавшее по ключу относится к тому, о чём говорят прямо сейчас, и идёт
+    # первым. Записи «всегда» — фон, и место им в остатке бюджета. Раньше те и
+    # другие сваливались в одну кучу и сортировались только по prio: у книги с
+    # девятнадцатью постоянными записями на двенадцать тысяч знаков фон съедал
+    # полторы тысячи бюджета целиком, и запись, реально совпавшая с разговором,
+    # до модели не доезжала никогда.
+    hits = sorted((r for r in rows if _hits(r, text)),
+                  key=lambda r: r["prio"])
+    seen = {r["id"] for r in hits}
+    const = sorted((r for r in rows if r["always"] and r["id"] not in seen),
+                   key=lambda r: r["prio"])
+    picked = hits + const
     budget = BUDGET
     if not picked:
         # Готовые книги с chub почти всегда с английскими ключами, а чат русский:
         # так они не срабатывают никогда и бот говорит ни о чём. Поэтому даём
-        # фон — небольшой кусок книги, каждый раз следующий по кругу. Заодно
-        # разная справка каждый раз мешает модели повторять одну и ту же мысль.
+        # фон — небольшой кусок книги, каждый раз следующий по кругу.
+        #
+        # Но бьёт этот фон по площадям: в промпт уезжает справка, к разговору
+        # отношения не имеющая, и небольшая модель охотно цепляется за неё и
+        # уводит разговор в сторону. Отсюда выключатель: с крупной моделью фон
+        # оживляет мир, с маленькой — мешает.
+        if not background:
+            return ""
         start = _turn.get(chat_id, 0) % len(rows)
         _turn[chat_id] = start + 1
         picked = rows[start:] + rows[:start]
@@ -275,6 +333,10 @@ async def apply_card(chat_id: int, card: dict) -> list[str]:
     if card.get("persona"):
         await db.set_setting(chat_id, "ai_persona", card["persona"][:PERSONA_LIMIT])
         done.append("характер")
+    if card.get("examples"):
+        await db.set_setting(chat_id, "ai_examples",
+                             card["examples"][:config.AI_EXAMPLE_LIMIT])
+        done.append("примеры реплик")
     if card.get("greeting"):
         # first_mes карточки — это первая реплика героя. Уходит в настройки,
         # а оттуда в чат при включении разума: знакомиться персонаж должен

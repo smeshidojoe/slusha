@@ -30,6 +30,7 @@ _HOME = ("<b>🧠 Слюша</b>\n\nБот-собеседник. Добавьт�
 class Input(StatesGroup):
     persona = State()     # ждём текст характера или файл карточки
     names = State()       # ждём имена-обращения
+    examples = State()    # ждём примеры реплик
     lore_file = State()   # ждём файл лорбука
     lore_entry = State()  # ждём запись «ключи | текст»
     access = State()      # ждём id/@username для доступа
@@ -91,7 +92,13 @@ async def view_chat(cid: int) -> tuple[str, InlineKeyboardMarkup]:
     s = await db.get_settings(cid)
     spent = await ai.spent_today(cid)
     limit = f"из {s.ai_daily}" if ai.capped() else "без лимита"
-    persona = "своя" if s.ai_persona else "по умолчанию"
+    # длину показываем всегда: характер уезжает в модель на каждый запрос
+    # и делит окно с историей, а карточки с chub бывают на пять тысяч знаков
+    size = len(s.ai_persona or "")
+    persona = f"{size} знаков" if s.ai_persona else "по умолчанию"
+    if size > config.AI_PERSONA_SOFT:
+        persona += " ⚠️"
+    ex = len([r for r in (s.ai_examples or "").split("\n") if r.strip()])
     names = len([n for n in (s.ai_names or "").split(",") if n.strip()])
     kept, _ = await store.summary_get(cid)
     notes = f"{len(kept)} знаков" if kept.strip() else "пока нет"
@@ -119,6 +126,7 @@ async def view_chat(cid: int) -> tuple[str, InlineKeyboardMarkup]:
                        f"m:y:{cid}:{f.key}:+"),
                   _btn("▶", f"m:y:{cid}:{f.key}:+"))
     b.row(_btn(f"🎭 Характер: {persona}", f"m:persona:{cid}"))
+    b.row(_btn(f"💬 Примеры реплик: {ex or 'нет'}", f"m:ex:{cid}"))
     b.row(_btn(f"🔔 Имена-обращения: {names}", f"m:names:{cid}"))
     b.row(_btn(f"📚 Лорбук: {await db.lore_count(cid)}", f"m:lore:{cid}:0"))
     b.row(_btn(f"🧠 Заметки о чате: {notes}", f"m:sum:{cid}"))
@@ -430,9 +438,14 @@ async def cb_persona(cb: CallbackQuery, state: FSMContext) -> None:
         "<b>🎭 Характер</b>\n\nОпишите, кто такой бот и как он говорит — это "
         "уходит модели как инструкция.\n"
         "Можно прислать <b>файл карточки</b> с chub.ai (JSON или PNG): возьму "
-        "описание, имя и книгу лора, если она внутри.\n"
+        "описание, имя, примеры реплик и книгу лора, если она внутри.\n"
+        f"<b>Длина важна.</b> Характер уезжает в модель на каждый запрос и "
+        f"делит окно с историей чата: на пять тысяч знаков он занимает половину "
+        f"промпта, и вопрос собеседника в нём тонет. Рабочий размер — до "
+        f"{config.AI_PERSONA_SOFT} знаков: кто он и как говорит. Внешность, "
+        f"биографию и таблицы атрибутов на реплику в чате можно не описывать.\n"
         "Вернуть характер по умолчанию — пришлите <code>-</code>.\n\n"
-        f"Сейчас:\n{cur[:2500]}",
+        f"Сейчас ({len(s.ai_persona or '')} знаков):\n{cur[:2000]}",
         f"m:c:{cid}", cid=cid,
     )
 
@@ -468,6 +481,38 @@ async def persona_input(message: Message, state: FSMContext, bot: Bot) -> None:
     if text:
         await db.set_setting(cid, "ai_persona",
                              None if text == "-" else text[:config.AI_PERSONA_LIMIT])
+    await _finish(message, bot, state, await view_chat(cid))
+
+
+@router.callback_query(F.data.startswith("m:ex:"))
+async def cb_examples(cb: CallbackQuery, state: FSMContext) -> None:
+    cid = int(cb.data.split(":")[2])
+    if not await _guard(cb, cid):
+        return
+    s = await db.get_settings(cid)
+    cur = (f"\n\nСейчас:\n<code>{utils.esc(s.ai_examples)}</code>"
+           if s.ai_examples else "\n\nСейчас пусто.")
+    await _ask(
+        cb, state, Input.examples,
+        "<b>💬 Примеры реплик</b>\n\nНесколько строк того, как персонаж "
+        "разговаривает. Уходят в начало переписки как образец манеры: модель "
+        "копирует показанное охотнее, чем описанное словами, и на небольших "
+        "моделях это работает сильнее, чем страница описания в характере.\n"
+        "Формат — по строке на реплику:\n"
+        "<code>собеседник: почём яблоки?\nты: дороже, чем вчера. Жизнь такая.</code>\n"
+        "Из карточки chub.ai берутся сами, если там заполнено mes_example.\n"
+        "Убрать — пришлите <code>-</code>." + cur,
+        f"m:c:{cid}", cid=cid,
+    )
+
+
+@router.message(StateFilter(Input.examples))
+async def examples_input(message: Message, state: FSMContext, bot: Bot) -> None:
+    cid = (await state.get_data())["cid"]
+    text = (message.text or "").strip()
+    if text:
+        await db.set_setting(cid, "ai_examples",
+                             None if text == "-" else text[:config.AI_EXAMPLE_LIMIT])
     await _finish(message, bot, state, await view_chat(cid))
 
 

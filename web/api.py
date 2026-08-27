@@ -86,6 +86,8 @@ async def chat(request: web.Request) -> web.Response:
         "settings": {f.key: getattr(s, f.key) for f in schema.FIELDS},
         "persona": s.ai_persona or "",
         "persona_default": config.AI_PERSONA_DEFAULT,
+        "persona_soft": config.AI_PERSONA_SOFT,
+        "examples": s.ai_examples or "",
         "names": s.ai_names or "",
         "greeting": s.ai_greeting or "",
         "spent": await ai.spent_today(cid),
@@ -139,6 +141,14 @@ async def persona(request: web.Request) -> web.Response:
     text = text.strip()[:config.AI_PERSONA_LIMIT]
     await db.set_setting(cid, "ai_persona", text or None)
     return js({"ok": True, "len": len(text)})
+
+
+@routes.post("/api/chat/{cid}/examples")
+async def examples(request: web.Request) -> web.Response:
+    cid = await _chat_id(request)
+    text = ((await _body(request)).get("text") or "").strip()[:config.AI_EXAMPLE_LIMIT]
+    await db.set_setting(cid, "ai_examples", text or None)
+    return js({"ok": True})
 
 
 @routes.post("/api/chat/{cid}/names")

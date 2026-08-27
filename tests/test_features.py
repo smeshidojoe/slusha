@@ -138,6 +138,70 @@ async def main():
     check("прямое обращение отвечается и на шуме",
           await ai.should_reply(bot, msg("@slusha_bot ок"), s))
 
+    # --- шанс ответить на ответ себе ---
+    # Раньше реплай боту отвечался всегда, и разговор вырождался в пинг-понг:
+    # человек отвечает боту, бот обязательно человеку, тот снова боту.
+    def from_bot(text="моя реплика"):
+        return SimpleNamespace(from_user=SimpleNamespace(id=1000,
+                                                         username="slusha_bot",
+                                                         full_name="Слюша"),
+                               text=text, caption=None, message_id=99)
+
+    def from_human(text="чужая реплика"):
+        return SimpleNamespace(from_user=SimpleNamespace(id=8, username="petya",
+                                                         full_name="Петя"),
+                               text=text, caption=None, message_id=98)
+
+    await db.set_setting(CID, "ai_random", 0)
+    await db.set_setting(CID, "ai_names", "слюша")
+    await db.set_setting(CID, "ai_reply", 35)
+    s = await db.get_settings(CID)
+    check("значение по умолчанию — 35", s.ai_reply == 35)
+
+    to_bot = msg("а почему так", mid=20, reply=from_bot())
+    check("реплай боту распознан", await ai.replied_to(bot, to_bot))
+    check("реплай другому — не нам",
+          not await ai.replied_to(bot, msg("ага", mid=21, reply=from_human())))
+
+    real = ai.random.randrange
+    ai.random.randrange = lambda n: 10          # бросок ниже 35
+    try:
+        check("удачный бросок — отвечаем", await ai.should_reply(bot, to_bot, s))
+    finally:
+        ai.random.randrange = real
+    ai.random.randrange = lambda n: 40          # бросок выше 35
+    try:
+        check("неудачный бросок — молчим", not await ai.should_reply(bot, to_bot, s))
+        check("и на случайный шанс это не проваливается",
+              not await ai.should_reply(bot, to_bot, s))
+        by_name = msg("слюша, а почему так", mid=22, reply=from_bot())
+        check("имя в том же сообщении отвечается всегда",
+              await ai.should_reply(bot, by_name, s))
+    finally:
+        ai.random.randrange = real
+
+    await db.set_setting(CID, "ai_reply", 0)
+    s = await db.get_settings(CID)
+    check("ноль — на реплаи не отвечаем вовсе",
+          not any([await ai.should_reply(bot, to_bot, s) for _ in range(50)]))
+    check("но по имени зовётся по-прежнему",
+          await ai.should_reply(bot, msg("слюша ау", mid=23), s))
+
+    await db.set_setting(CID, "ai_reply", 100)
+    s = await db.get_settings(CID)
+    check("сотня — отвечаем на каждый ответ себе",
+          all([await ai.should_reply(bot, to_bot, s) for _ in range(50)]))
+
+    # частота держится около выставленной
+    await db.set_setting(CID, "ai_reply", 35)
+    s = await db.get_settings(CID)
+    hits = sum([await ai.should_reply(bot, to_bot, s) for _ in range(2000)])
+    check(f"частота около 35% (вышло {hits * 100 // 2000}%)",
+          500 < hits < 900)
+
+    await db.set_setting(CID, "ai_names", "")
+    await db.set_setting(CID, "ai_random", 100)
+
     # --- A3: лимит токенов зависит от длины ответа ---
     lens = {}
     for value in (0, 1, 2):
@@ -217,13 +281,14 @@ async def main():
     ai._ask_ollama = real_ollama
     http = FakeHttp()
     ai._client = http
-    await ai._ask_ollama("sys", "вопрос", 700, ["QkFTRTY0"])
+    one = [{"role": "user", "content": "вопрос"}]
+    await ai._ask_ollama("sys", one, 700, ["QkFTRTY0"])
     body = http.calls[-1][1]
     check("ollama: картинки отдельным полем сообщения",
           body["messages"][-1]["images"] == ["QkFTRTY0"])
     check("ollama: лимит токенов из настройки", body["options"]["num_predict"] == 700)
 
-    await ai._ask_openai("sys", "вопрос", 700, ["QkFTRTY0"])
+    await ai._ask_openai("sys", one, 700, ["QkFTRTY0"])
     body = http.calls[-1][1]
     content = body["messages"][-1]["content"]
     check("openai: картинка как data-url",
@@ -231,10 +296,115 @@ async def main():
           and content[0]["image_url"]["url"].startswith("data:image/jpeg;base64,"))
     check("openai: текст следом за картинкой", content[-1]["text"] == "вопрос")
     check("openai: лимит токенов из настройки", body["max_tokens"] == 700)
-    await ai._ask_openai("sys", "вопрос", 700)
+    await ai._ask_openai("sys", one, 700)
     check("без картинок content остаётся строкой",
           http.calls[-1][1]["messages"][-1]["content"] == "вопрос")
+    check("системный промпт идёт отдельной ролью",
+          http.calls[-1][1]["messages"][0]["role"] == "system")
     ai._client = None
+
+    # --- диалог ходами вместо простыни текста ---
+    rows_d = [Line("@vasya", "почём яблоки"), Line(ai.SELF, "дороже вчерашнего"),
+              Line("@petya", "грабёж"), Line("@petya", "но возьму")]
+    t = ai.turns(rows_d)
+    check("чужие реплики — ход user", t[0] == {"role": "user",
+                                               "content": "@vasya: почём яблоки"})
+    check("свои — ход assistant без подписи",
+          t[1] == {"role": "assistant", "content": "дороже вчерашнего"})
+    check("подряд идущие одной роли склеены",
+          len(t) == 3 and t[2]["content"] == "@petya: грабёж\n@petya: но возьму")
+    check("роли строго чередуются",
+          all(a["role"] != b["role"] for a, b in zip(t, t[1:])))
+    check("реакции едут вместе с репликой",
+          "[реакции: 🔥]" in ai.turns([Line("@v", "шутка", 1, None, None, "🔥")])[0]["content"])
+
+    # --- примеры реплик из карточки ---
+    await db.set_setting(CID, "ai_examples",
+                         "собеседник: почём яблоки?\nты: дороже, чем вчера.")
+    s = await db.get_settings(CID)
+    ex = ai.examples(s)
+    check("примеры разобрались", len(ex) == 2 and ex[1].who == ai.SELF)
+    check("в промпте про них сказано", ai._EXAMPLE_NOTE in ai._prompt(s, "Чат", "@v"))
+
+    sent = {}
+
+    async def spy(system, messages, tokens=0, images=None):
+        sent["s"], sent["m"] = system, messages
+        return "ответ"
+
+    ai._ask_ollama = spy
+    await ai.ask(s, "Чат", CID, "@vasya", "а сегодня?", snapshot=[])
+    check("примеры идут первыми ходами",
+          sent["m"][0]["content"].startswith("собеседник: почём яблоки?"))
+    check("ответ персонажа в примере — ход assistant",
+          sent["m"][1] == {"role": "assistant", "content": "дороже, чем вчера."})
+    check("задание идёт последним ходом",
+          sent["m"][-1]["role"] == "user"
+          and "Отвечай на эту реплику" in sent["m"][-1]["content"])
+    check("простыни <chat> больше нет", "<chat>" not in ai.flatten(sent["m"]))
+
+    await db.set_setting(CID, "ai_examples", None)
+    s = await db.get_settings(CID)
+    check("без примеров пояснения о них нет",
+          ai._EXAMPLE_NOTE not in ai._prompt(s, "Чат", "@v"))
+
+    # примеры из настоящей карточки chub: раньше это поле выбрасывалось
+    from slusha import lore as lorem
+    card = lorem.parse_card({"data": {
+        "name": "Holo", "description": "Мудрая волчица.",
+        "mes_example": "<START>\n{{user}}: почём яблоки?\n"
+                       "{{char}}: дороже вчерашнего.\n"
+                       "<START>\n{{user}}: ты пьяна?\n{{char}}: вовсе нет!"}})
+    check("mes_example разобран", card["examples"].count("\n") == 3)
+    check("герой подписан как «ты»", card["examples"].startswith("собеседник: почём"))
+    check("плейсхолдеры не просочились", "{{" not in card["examples"])
+    done = await lorem.apply_card(CID, card)
+    check("импорт кладёт примеры в настройки", "примеры реплик" in done)
+    check("и они видны боту",
+          len(ai.examples(await db.get_settings(CID))) == 4)
+    await db.set_setting(CID, "ai_examples", None)
+
+    # --- фоновый лор выключается ---
+    from slusha import lore
+    await db.lore_add(CID, "wheat, harvest", "Пшеница родит раз в год. " * 30)
+    hit = await lore.block(CID, "расскажи про wheat")
+    check("по совпавшему ключу лор просыпается", bool(hit))
+    bg = await lore.block(CID, "привет как дела", background=True)
+    check("без совпадений фон подмешивается", bool(bg))
+    off = await lore.block(CID, "привет как дела", background=False)
+    check("и выключается тумблером", off == "")
+    always = await lore.block(CID, "привет как дела", background=False)
+    check("выключатель не трогает совпавшее по ключу",
+          bool(await lore.block(CID, "про wheat речь", background=False)) and always == "")
+    await db.lore_clear(CID)
+
+    # --- совпавшее по ключу идёт вперёд фона ---
+    # Записи «всегда» раньше сваливались в одну кучу с совпавшими и по prio
+    # съедали бюджет целиком: то, что реально относилось к разговору, до
+    # модели не доезжало.
+    await db.lore_clear(CID)
+    for i in range(6):
+        await db.lore_add(CID, "", "Постоянная справка о мире номер %d. " % i * 25,
+                          always=1, prio=1)
+    await db.lore_add(CID, "пиво", "В баре наливают тёмное, по три монеты." * 8,
+                      always=0, prio=99)
+    block = await lore.block(CID, "кто пойдёт за пивом", background=False)
+    check("совпавшее по ключу попало в промпт", "тёмное" in block)
+    check("и стоит первым, до фона",
+          block.index("тёмное") < block.index("Постоянная"))
+    check("фон занимает остаток бюджета", "Постоянная" in block)
+    only_bg = await lore.block(CID, "погода дрянь", background=False)
+    check("без совпадений остаётся один фон",
+          "Постоянная" in only_bg and "тёмное" not in only_bg)
+    check("бюджет соблюдён", len(block) <= config.LORE_BUDGET + 200)
+    await db.lore_clear(CID)
+
+    # --- рамки промпта стали короче и без запретов ---
+    frames = ai._FRAME_STYLE + ai._FRAME_STRICT
+    check(f"рамки укоротились ({len(frames)} знаков)", len(frames) < 800)
+    check("запретов в стиле не осталось",
+          "не повторяй" not in ai._FRAME_STYLE.lower()
+          and "без списков" not in ai._FRAME_STYLE.lower())
 
     # --- B3: ветка реплаев ---
     rows = [

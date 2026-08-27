@@ -93,7 +93,9 @@ async def settle(done, tries=200):
 
 
 async def fake_model(system, question, tokens=0, images=None):
-    ASKED.append((system, question, tokens))
+    from slusha import ai
+    text = ai.flatten(question) if isinstance(question, list) else question
+    ASKED.append((system, text, tokens))
     return "Вася — за пивом. Петя всегда пас. Шутка про овощехранилище."
 
 
@@ -105,13 +107,16 @@ async def main():
     await db.init()
     cols = await db.columns("settings")
     check("новые колонки настроек дописаны",
-          {"ai_lang", "ai_vision", "ai_topics", "ai_greeting"} <= cols)
+          {"ai_reply", "ai_lang", "ai_vision", "ai_topics", "ai_greeting"} <= cols)
     s = await db.get_settings(CID)
     check("старые значения уцелели",
           (s.ai_random, s.ai_ctx, s.ai_daily, s.ai_len, s.ai_free) == (10, 80, 500, 2, 1))
     check("характер на месте", s.ai_persona == "ехидный торговец")
     check("у новых полей значения по умолчанию",
           (s.ai_lang, s.ai_vision, s.ai_topics) == (1, 0, 0))
+    # ALTER TABLE с DEFAULT заполняет и уже существующие строки: чат из старой
+    # базы получает 35%, а не ноль
+    check("шанс ответить на ответ себе доехал до старого чата", s.ai_reply == 35)
     await db._migrate()                       # повторный прогон ничего не ломает
     check("миграция идемпотентна", (await db.get_settings(CID)).ai_ctx == 80)
 
