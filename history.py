@@ -14,6 +14,7 @@
 что уже уехало за пределы окна контекста. Это тоже переписка, поэтому «забыть
 переписку» стирает и её.
 """
+import asyncio
 import logging
 import os
 import time
@@ -26,6 +27,8 @@ from . import config
 logger = logging.getLogger("slusha.history")
 
 _db: aiosqlite.Connection | None = None
+# замок на открытие: см. _conn()
+_opening = asyncio.Lock()
 
 # сколько реплик чата держим на диске; в памяти — не больше того же
 KEEP = 200
@@ -47,6 +50,9 @@ class Line(NamedTuple):
     reply_to: int | None = None
     thread_id: int | None = None
     reactions: str = ""
+    # когда сказано: по разрывам во времени в промпте ставится метка, иначе
+    # вчерашний разговор выглядит продолжением сегодняшнего
+    ts: int = 0
 
 
 # Базовая схема. Тут только то, что было с самого начала: всё, что появилось
@@ -111,17 +117,32 @@ async def _migrate(db: aiosqlite.Connection) -> None:
 
 
 async def _conn() -> aiosqlite.Connection:
-    """Соединение с базой переписки. Открывается при первом обращении."""
+    """Соединение с базой переписки. Открывается при первом обращении.
+
+    Открытие под замком. Первое обращение приходит сразу из нескольких задач:
+    реакции в чате прилетают пачкой, и каждая лезет в базу своим хендлером.
+    Без замка все они видели `_db is None`, открывали по соединению и
+    выполняли PRAGMA поверх чужой начатой транзакции. SQLite отвечал на это
+    «Safety level may not be changed inside a transaction», реакция терялась,
+    а в лог сыпались трейсбеки.
+    """
     global _db
-    if _db is None:
+    if _db is not None:
+        return _db
+    async with _opening:
+        if _db is not None:          # пока ждали замок, соединение уже открыли
+            return _db
         os.makedirs(os.path.dirname(config.HISTORY_DB) or ".", exist_ok=True)
-        _db = await aiosqlite.connect(config.HISTORY_DB)
-        _db.row_factory = aiosqlite.Row
-        await _db.execute("PRAGMA journal_mode=WAL")
-        await _db.execute("PRAGMA synchronous=NORMAL")
-        await _db.executescript(_SCHEMA)
-        await _db.commit()
-        await _migrate(_db)
+        conn = await aiosqlite.connect(config.HISTORY_DB)
+        conn.row_factory = aiosqlite.Row
+        await conn.execute("PRAGMA journal_mode=WAL")
+        await conn.execute("PRAGMA synchronous=NORMAL")
+        await conn.executescript(_SCHEMA)
+        await conn.commit()
+        await _migrate(conn)
+        # выставляем в самом конце: пока идёт разметка схемы, чужим задачам
+        # это соединение отдавать нельзя
+        _db = conn
     return _db
 
 
@@ -160,7 +181,7 @@ async def add(chat_id: int, who: str, text: str, msg_id: int | None = None,
 
 def _line(r) -> Line:
     return Line(r["who"], r["text"], r["msg_id"], r["reply_to_id"],
-                r["thread_id"], r["reactions"] or "")
+                r["thread_id"], r["reactions"] or "", r["ts"] or 0)
 
 
 async def tail(chat_id: int, limit: int) -> list[Line]:

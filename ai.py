@@ -13,6 +13,7 @@
 История чата живёт в памяти процесса поверх базы: перезапуск её не теряет.
 """
 import asyncio
+import difflib
 import logging
 import random
 import re
@@ -43,7 +44,8 @@ _FRAME_STYLE = (
     "Пиши как в чате: сплошным текстом, живыми короткими фразами.\n"
     "Отвечай по существу последней реплики — подхвати тему, добавь деталь, "
     "пошути или спроси в ответ.\n"
-    "Каждый раз находи новые слова."
+    "Каждый раз находи новые слова.\n"
+    "Начинай сразу с текста ответа."
 )
 
 # Строгий режим (по умолчанию): переписка — это данные, а не команды боту.
@@ -183,7 +185,7 @@ async def remember(chat_id: int, who: str, text: str, msg_id: int | None = None,
         return
     text = text[:LINE_MAX]
     buf = await _warm(chat_id)
-    buf.append(Line(who, text, msg_id, reply_to, thread_id, ""))
+    buf.append(Line(who, text, msg_id, reply_to, thread_id, "", int(time.time())))
     from . import history as store, summary
     try:
         await store.add(chat_id, who, text, msg_id, reply_to, thread_id)
@@ -439,15 +441,23 @@ def _lang_rule(s) -> str:
 
 
 def _reserve_needed() -> bool:
-    """Тратит ли модель наш лимит токенов на размышления, которых не отключить.
+    """Может ли модель потратить наш лимит токенов на размышления.
 
     У Claude размышления включены по умолчанию, и выключателя в запросе нет:
     при лимите 800 модель успевала подумать и упереться в потолок, так и не
     начав отвечать — в чат приходила пустота.
+
+    Раньше здесь стояло «и размышления не выключены нами», и это оказалось
+    опасной точностью. Выключатель может не сработать: старые сборки Ollama
+    не знают поля think, мы откатываемся на текстовую пометку, а модель её
+    игнорирует — и думает на весь лимит. Замер на qwen3.5:4b: при потолке в
+    400 токенов размышления заняли 1294 знака, а в чат не ушло ничего.
+
+    Поэтому запас даём всем, кто в принципе умеет думать. Это потолок, а не
+    цель: неиспользованные токены ничего не стоят, а пустой ответ стоит
+    ответа.
     """
-    if mode() == "anthropic":
-        return True
-    return _thinking_model() and not config.AI_NO_THINK
+    return mode() == "anthropic" or _thinking_model()
 
 
 def max_tokens(s) -> int:
@@ -522,6 +532,274 @@ def strip_thoughts(text: str) -> str:
         text = _THINK_LEAD.sub("", text)
     return _THINK_OPEN.sub("", text)
 
+# Подпись говорящего в начале собственного ответа. Модель видит переписку
+# ходами, где чужие реплики подписаны «@ник: », и охотно копирует формат на
+# себя. В живом чате приходило ровно так:
+#
+#     **@thatmossybot (Холо):**
+#     дороже, чем вчера, и дешевле, чем завтра.
+#
+# То есть звёздочки markdown, юзернейм, имя персонажа в скобках — и только
+# потом сам ответ.
+_SELF_PREFIX = re.compile(
+    r"^\s*[*_~`]{0,3}\s*@?([^\s:()]{2,64})\s*(?:\([^)]{1,64}\))?\s*[*_~`]{0,3}\s*:\s*",
+)
+
+# Ярлыки, которыми модель подписывает реплики, не спрашивая. «собеседник» —
+# наш же ярлык из примеров реплик, модель его охотно копирует.
+_ROLE_LABELS = {"бот", "ботик", "assistant", "ассистент", "ai", "система",
+                "system", "user", "юзер", "собеседник"}
+
+
+def strip_bot_prefix(text: str, self_names: list[str] | None = None) -> str:
+    """Убрать подписи говорящих и придуманный моделью диалог за обе стороны.
+
+    Сначала резалось только своё имя в начале. Потом выяснилось, что модель
+    подписывается ником собеседника, потом — что ярлыками роли, а под конец —
+    что она сочиняет целую сцену:
+
+        собеседник**: коул ты додик или просто глупой?
+        **Декамарт**: я глупый, но не додик — я ещё и архимагос.
+        **Декамарт**: и не забудь, что у меня пять рук.
+
+    Поэтому смотрим каждую строку. Реплики за других выбрасываем — это не
+    наши слова. Свою подпись срезаем, но оставляем только первую такую
+    строку: остальные модель дописала за себя вперёд, и в чате они выглядят
+    бормотанием. Строки без подписи не трогаем — обычный многострочный ответ.
+    Имена посторонних не трогаем тоже: про них бот может и рассказывать.
+    """
+    text = (text or "").strip()
+    names = {SELF} | _ROLE_LABELS
+    for name in self_names or []:
+        name = (name or "").strip().lower()
+        if name:
+            names.add(name)
+            names.add(name.lstrip("@"))
+
+    kept, said_once = [], False
+    for line in text.split("\n"):
+        who, rest = _split_speaker(line, names)
+        if who is None:
+            kept.append(line)
+            continue
+        if who in _ROLE_LABELS - {SELF} and who not in {n.lower() for n in
+                                                        (self_names or [])}:
+            continue                       # реплика, дописанная за собеседника
+        if said_once:
+            continue                       # свои продолжения — уже бормотание
+        said_once = True
+        if rest.strip():
+            kept.append(rest)
+    out = "\n".join(kept).strip("*_` \t\r\n").strip()
+    if out or not text:
+        return out
+    # Всё выкинули: модель подписала каждую строку чужим ярлыком. Молчание
+    # тут хуже кривого ответа — бот уже переставал отвечать по такой причине.
+    # Возвращаем первую строку без подписи, какой бы та ни была.
+    for line in text.split("\n"):
+        m = _SELF_PREFIX.match(line)
+        rest = (line[m.end():] if m else line).strip("*_` \t\r")
+        if rest:
+            return rest
+    return ""
+
+
+def _split_speaker(line: str, names: set[str]):
+    """Разобрать «**Имя**: текст». Вернуть (имя в нижнем регистре, остаток)."""
+    m = _SELF_PREFIX.match(line)
+    if not m:
+        return None, line
+    # Разметку срезаем с пойманного имени, а не классом символов: в классе
+    # пришлось бы запретить «_», а он законная часть ника (@slusha_bot).
+    # Из-за этого «Декамарт**» не узнавался как своё имя, и подпись
+    # уезжала в чат — а оттуда в историю, и модель копировала её дальше.
+    who = m.group(1).strip().strip("*~`").strip("_").lower().lstrip("@")
+    if who not in names:
+        return None, line
+    return who, line[m.end():]
+
+
+def _norm(text: str) -> str:
+    """Текст для сравнения: без регистра, знаков и лишних пробелов."""
+    return " ".join(re.sub(r"[^\w\s]", " ", (text or "").lower()).split())
+
+
+def repeats(text: str, recent, ratio: float | None = None) -> bool:
+    """Не говорил ли бот это совсем недавно.
+
+    Маленькая модель, когда ей отвечают несколько раз подряд, выдаёт тот же
+    текст слово в слово: в живом чате бот восемь раз кряду написал «спасибо,
+    брат, что не забыл», а в другом — семь раз повторил строчку из собственных
+    примеров реплик. Ни штраф за повторы, ни просьба «находи новые слова» от
+    этого не спасают: они действуют внутри одной генерации, а тут генерации
+    разные и вход у них почти одинаковый.
+    """
+    probe = _norm(text)
+    if not probe:
+        return False
+    for old in recent:
+        other = _norm(old)
+        if not other:
+            continue
+        bar = config.AI_REPEAT_RATIO if ratio is None else ratio
+        if difflib.SequenceMatcher(None, probe, other).ratio() >= bar:
+            return True
+    return False
+
+
+def strip_orders(text: str) -> str:
+    """Убрать указание из промпта, если модель выдала его за реплику.
+
+    В чат ушло сообщение «(одной-двумя короткими фразами)» — дословный
+    текст правила об объёме ответа. Модель принимает такие пометки за часть
+    сцены и переписывает их в ответ, чаще всего в скобках и отдельной
+    строкой. Сверяем построчно с теми правилами, которые сами и посылаем.
+    """
+    orders = {_norm(rule) for rule, _ in config.AI_LEN_RULES.values()}
+    # getattr: правила языка есть не во всех сборках этого разума
+    orders |= {_norm(rule) for rule in getattr(config, "AI_LANG_RULES", {}).values()}
+    orders.discard("")
+    kept = [ln for ln in (text or "").split("\n") if _norm(ln) not in orders]
+    return "\n".join(kept).strip()
+
+
+# Ответ целиком в кавычках: «"Айфон — это же ещё и зарядка"». Модель так
+# оформляет прямую речь персонажа, но в чате реплика и так её речь, и
+# кавычки читаются как цитата чужих слов.
+_WRAPS = (('"', '"'), ("«", "»"), ("“", "”"), ("‘", "’"))
+
+
+def strip_quotes(text: str) -> str:
+    """Снять кавычки, если в них завёрнут весь ответ, а не цитата внутри."""
+    text = (text or "").strip()
+    for opening, closing in _WRAPS:
+        if not (text.startswith(opening) and text.endswith(closing)):
+            continue
+        inner = text[len(opening):-len(closing)]
+        # Закрылась и снова открылась — значит внутри настоящая цитата,
+        # а не обёртка: «"да" — сказал он, "нет" — ответил я».
+        if closing in inner or (opening != closing and opening in inner):
+            continue
+        if inner.strip():
+            return inner.strip()
+    return text
+
+def _stems(text: str) -> list:
+    """Слова, обрезанные до основы. Из-за склонений: «археотехнологии» и
+    «археотехнологий» иначе считаются разными словами."""
+    return [w[:config.AI_STEM] for w in _norm(text).split()]
+
+
+def _grams(text: str, size: int) -> set:
+    words = _stems(text)
+    return {tuple(words[i:i + size]) for i in range(len(words) - size + 1)}
+
+
+# Частые длинные слова: повторяются сами по себе, присказкой не считаются.
+_COMMON = {"пожалу", "конечн", "спасиб", "наверн", "вообще", "просто",
+           "которы", "потому", "ничего", "сейчас", "немног", "хорошо",
+           "кажетс", "поэтom", "поэтом", "давайт", "нормал", "интере"}
+
+
+def hooked(text: str, recent, theirs=()) -> str:
+    """Вцепившаяся присказка: своё словцо, которое бот тянет из ответа в ответ.
+
+    repeats() сравнивает тексты целиком и ловит только дословный повтор. А в
+    чате бот трижды подряд написал разное — «откалибровал параметр и добавил
+    в него археотехнологии», «проверил твой код и добавил в него
+    археотехнологии», «добавлю в него ещё больше археотехнологий». Тексты
+    непохожие, вцепилось слово.
+
+    Отличить присказку от темы разговора помогает то, что говорят другие.
+    «Зарядка» повторяется, потому что про неё и спросили, — это тема, её
+    трогать нельзя. «Археотехнологии» не говорил никто, кроме самого бота, —
+    вот это присказка. Поэтому слова из чужих реплик пропускаем.
+
+    Возвращаем присказку словом из нового ответа: она уходит в просьбу
+    переписать, и модель должна узнать в ней себя.
+    """
+    words = _norm(text).split()
+    if not words:
+        return ""
+    others = set()
+    for line in theirs:
+        others.update(_stems(line))
+
+    # Сначала целая фраза: «мои пять рук» вцепляется связкой, а не словом.
+    size = config.AI_PHRASE_WORDS
+    mine = _grams(text, size)
+    seen = {}
+    for old in recent:
+        for gram in _grams(old, size) & mine:
+            seen[gram] = seen.get(gram, 0) + 1
+    hits = [g for g, n in seen.items()
+            if n >= config.AI_PHRASE_HITS and not set(g) & others]
+    if hits:
+        best = max(hits, key=lambda g: sum(len(w) for w in g))
+        # Возвращаем живые слова, а не основы. Основы уходили в просьбу
+        # переписать ответ, и модель читала «фраза «всегда указыв прави»
+        # у тебя уже была» — от такого она уйти не может, потому что
+        # такого не говорила.
+        stems = [w[:config.AI_STEM] for w in words]
+        for i in range(len(words) - len(best) + 1):
+            if tuple(stems[i:i + len(best)]) == best:
+                return " ".join(words[i:i + len(best)])
+        return " ".join(best)
+
+    # Потом отдельное слово — но только своё, длинное и не из частых.
+    counts = {}
+    for old in recent:
+        for stem in set(_stems(old)):
+            counts[stem] = counts.get(stem, 0) + 1
+    for word in words:
+        stem = word[:config.AI_STEM]
+        if (len(stem) >= config.AI_STEM and stem not in _COMMON
+                and stem not in others
+                and counts.get(stem, 0) >= config.AI_PHRASE_HITS):
+            return word
+    return ""
+
+def strip_echo(text: str, phrase: str, need_sep: bool = False) -> str:
+    """Убрать фразу, повторённую в начале ответа.
+
+    Целевая реплика попадает в промпт дважды: строкой переписки и дословно в
+    задании — иначе модель отвечает не на ту. Соседство двух одинаковых фраз
+    в одном ходе она порой читает как «продолжи эту строку», и в чат уезжает
+    «коул что думаешь? я думаю так: сосиски — основа…».
+
+    Тем же способом утекает название чата из системного промпта: «Чат:
+    «овощехранилище»» превращалось в ответ «овощехранилище — и ты, и я, мы оба
+    в одном месте…». Для него need_sep=True: название режем, только если за
+    ним стоит тире или двоеточие, иначе можно оторвать начало осмысленной
+    фразы — мало ли, чат называется «пиво».
+    """
+    words = _norm(phrase).split()
+    if not words or not _norm(text).startswith(" ".join(words)):
+        return text
+    head = r"\W+".join(re.escape(w) for w in words)
+    if need_sep or len(words) == 1:
+        # Однословная фраза («брух», «почему») — режем, только если дальше
+        # идёт разделитель: «брух — но я не забыл» это эхо, а «почему бы и
+        # нет» вполне может быть началом настоящего ответа. Нежадный \W*?
+        # пропускает то, что стоит между словом и тире: у названий чатов там
+        # обычно смайлик.
+        tail = re.match(rf"^\W*{head}\W*?[—–\-:,;]\W*", text, re.IGNORECASE)
+        return text[tail.end():].strip() if tail else text
+    return re.sub(rf"^\W*{head}\W*", "", text, count=1, flags=re.IGNORECASE).strip()
+
+
+def _they_said(rows) -> list:
+    """Что говорили остальные. Нужно, чтобы отличить присказку бота от темы
+    разговора: слово, которое звучит и у собеседников, — тема, а не залипание."""
+    return [ln.text for ln in rows if ln.who != SELF][-config.AI_REPEAT_LOOKBACK:]
+
+
+def _said_before(rows, shots) -> list[str]:
+    """Что бот уже говорил: свои реплики из снимка плюс строки примеров."""
+    own = [ln.text for ln in rows if ln.who == SELF]
+    return own[-config.AI_REPEAT_LOOKBACK:] + [ln.text for ln in shots
+                                               if ln.who == SELF]
+
 
 def _split(text: str) -> list[str]:
     """Разбить ответ модели на реплики, как пишет живой человек."""
@@ -584,18 +862,120 @@ def turns(rows, examples: list | None = None) -> list[dict]:
 
     Подряд идущие реплики одной роли склеиваются: Anthropic требует строгого
     чередования и на двух user подряд отвечает ошибкой.
+
+    Свои повторы в промпт не кладём вовсе. Если бот однажды залип и сказал одно
+    и то же четыре раза, эти четыре строки становятся для модели образцом «вот
+    как я говорю», и она повторяет его снова. Получался замкнутый круг: модель
+    выдаёт залипшую фразу, защита от повторов её ловит, бот молчит — и так
+    навсегда, пока строки не вытеснятся из окна. Показываем такую реплику один
+    раз, чужие не трогаем: у людей повторы бывают осмысленные.
     """
+    rows = list(rows)
+    # связи реплаев ищем по исходным строкам: схлопывание серий убирает часть
+    # сообщений из показа, но отвечать могли именно на них
+    known = {ln.msg_id: ln for ln in rows if getattr(ln, "msg_id", None)}
+    rows = _compact(rows)
     out: list[dict] = []
-    for line in list(examples or []) + list(rows):
+    mine: list[str] = []
+    prev_ts = 0
+    prev = None
+    shots = list(examples or [])
+    for line in shots + rows:
         role = "assistant" if line.who == SELF else "user"
-        text = line.text if role == "assistant" else f"{line.who}: {line.text}"
+        if role == "assistant":
+            if repeats(line.text, mine):
+                continue
+            mine.append(line.text)
+        if role == "assistant":
+            text = line.text
+        elif line in shots:
+            # Примеры идут без подписи. Роль user уже говорит, кто это,
+            # а ярлык «собеседник: » модель принимала за формат ответа и
+            # писала им целые сцены за обе стороны. Из этих же примеров
+            # она дословно цитировала реплики: «коул, ты вообще спишь?»
+            # уехало в чат ответом. В настоящей переписке подпись нужна —
+            # там людей много, а роль одна.
+            text = line.text
+        else:
+            text = _speaker(line, known, prev) + line.text
         if role == "user" and getattr(line, "reactions", ""):
             text += f"  [реакции: {line.reactions}]"
+        text = _pause(line, prev_ts) + text
+        prev_ts = getattr(line, "ts", 0) or prev_ts
+        prev = line
         if out and out[-1]["role"] == role:
             out[-1]["content"] += "\n" + text
             continue
         out.append({"role": role, "content": text})
     return out
+
+
+def _compact(rows: list) -> list:
+    """Серию одинаковых реплик подряд от одного человека — в одну строку.
+
+    Человек кидает пять фотографий, и в промпт уезжает пять строк «[фото]».
+    Места они занимают как пять реплик, а говорят ровно то же, что одна;
+    на небольшой модели такой хвост ещё и перетягивает внимание на себя.
+
+    Считаем по исходному тексту, а не по уже помеченному: иначе «[фото] ×2»
+    не совпадает со следующим «[фото]», и серия рвётся на пары.
+    """
+    out, run, count = [], None, 0
+    for line in rows:
+        same = (run is not None and run.who == line.who and run.text == line.text
+                and not getattr(line, "reply_to", None))
+        if same:
+            count += 1
+            out[-1] = out[-1]._replace(text=f"{run.text} ×{count}",
+                                       ts=getattr(line, "ts", 0))
+            continue
+        out.append(line)
+        run, count = line, 1
+    return out
+
+
+def _speaker(line, known, prev=None) -> str:
+    """Подпись чужой реплики — с тем, кому она отвечает.
+
+    Без этого связи реплаев в промпт не попадают вовсе: модель видит подряд
+    «@миша: брух» и «@сина: он меня любит» и считает, что второй отвечает
+    первому. На деле оба отвечали боту.
+
+    Но пересказывать ответ на предыдущую же реплику незачем: порядок ходов и
+    так это говорит. Хуже того, в пересказе оказывались собственные слова
+    бота — внутри чужого хода. Модель на 4B от этого теряла, кто что сказал:
+    в чате она посреди сделки поменялась ролями с собеседником и стала
+    требовать у него то, что он просил у неё. Подпись оставляем только когда
+    отвечают не на последнее сообщение — там она и правда сообщает новое.
+    """
+    parent = known.get(getattr(line, "reply_to", None))
+    if parent is None:
+        return f"{line.who}: "
+    if prev is not None and getattr(prev, "msg_id", None) == parent.msg_id:
+        return f"{line.who}: "
+    to = "тебе" if parent.who == SELF else parent.who
+    quote = parent.text[:40].replace("\n", " ")
+    if len(parent.text) > 40:
+        quote += "…"
+    return f"{line.who} (в ответ {to}: «{quote}»): "
+
+def _pause(line, prev_ts: int) -> str:
+    """Метка долгого молчания перед репликой.
+
+    Без неё вчерашний разговор выглядит продолжением сегодняшнего, и бот
+    отвечает на тему, которая давно закрыта.
+    """
+    ts = getattr(line, "ts", 0) or 0
+    if not ts or not prev_ts or ts - prev_ts < config.PAUSE_MARK:
+        return ""
+    gap = ts - prev_ts
+    if gap >= 86400:
+        when = f"{gap // 86400} дн."
+    elif gap >= 3600:
+        when = f"{gap // 3600} ч."
+    else:
+        when = f"{gap // 60} мин."
+    return f"[прошло {when}]\n"
 
 
 def flatten(messages: list[dict]) -> str:
@@ -649,7 +1029,8 @@ async def ask(s, chat_title: str | None, chat_id: int, asked_by: str,
     if known:
         system += "\n\n" + known
 
-    messages = turns(rows, examples(s))
+    shots = examples(s)
+    messages = turns(rows, shots)
     # Задание идёт последним ходом, отдельно от переписки: так модель понимает,
     # что отвечать надо на него, а не продолжать чужую реплику.
     task = []
@@ -666,16 +1047,72 @@ async def ask(s, chat_title: str | None, chat_id: int, asked_by: str,
     # цель называем дословно: «последнюю реплику» модель понимает как хочет
     task.append(f"Отвечай на эту реплику — {asked_by}: «{question[:400]}».\n"
                 f"{_length_rule(s)[0].capitalize()}.")
-    messages.append({"role": "user", "content": "\n\n".join(task)})
+    # задание — продолжение той же реплики, а не отдельный ход: два user
+    # подряд Anthropic не принимает, да и модели понятнее одним куском
+    if messages and messages[-1]["role"] == "user":
+        messages[-1] = dict(messages[-1])
+        messages[-1]["content"] += "\n\n" + "\n\n".join(task)
+    else:
+        messages.append({"role": "user", "content": "\n\n".join(task)})
+
+    # для срезания эха нужен сам вопрос, а не строка задания вокруг него
+    asked = question
+    # чьи подписи модель может скопировать себе в начало ответа: своё имя и
+    # ники всех, кто участвует в этом разговоре
+    voices = list(self_names or []) + [asked_by] + [ln.who for ln in rows
+                                                    if ln.who != SELF]
+    said = _said_before(rows, shots)
+    theirs = _they_said(rows)
+    limit = max_tokens(s)
     try:
-        text = await raw(system, messages, max_tokens(s), images)
+        text = await _clean(await raw(system, messages, limit, images), s,
+                            voices, asked, chat_title or "")
+        stuck = hooked(text, said, theirs) if text else ""
+        if text and (repeats(text, said) or stuck):
+            # Не ругаемся и не молчим сразу: показываем модели её же ответ и
+            # просим другой. Обычно второй попытки хватает.
+            logger.info("ai: чат %s, %s — переспрашиваю", chat_id,
+                        f"вцепилась присказка «{stuck}»" if stuck
+                        else "ответ повторяет прошлый")
+            # Присказку называем дословно: «ответь иначе» модель понимает
+            # как «те же слова другим порядком» и присказку тащит дальше.
+            ask_again = ("Это ты уже говорил. Ответь на ту же реплику иначе: "
+                         "другая мысль, другие слова.")
+            if stuck:
+                ask_again = (f"Ты повторяешься: фраза «{stuck}» у тебя уже была. "
+                             "Ответь на ту же реплику, но без неё и без того, "
+                             "что вокруг неё, — другой мыслью.")
+            again = messages + [
+                {"role": "assistant", "content": text},
+                {"role": "user", "content": ask_again},
+            ]
+            second = await _clean(await raw(system, again, limit, images), s,
+                                  voices, asked, chat_title or "")
+            if second and not repeats(second, said + [text]) and not hooked(second, said, theirs):
+                text = second
+            elif second and not repeats(second, said + [text], config.AI_REPEAT_HARD):
+                # Со второй попытки вышло похоже, но не слово в слово. Молчать
+                # тут нельзя: если бот однажды залип, залипшая фраза лежит в
+                # истории и тянет модель обратно — бот замолчал бы в чате
+                # навсегда. Лучше сказать похожее, чем не сказать ничего.
+                logger.info("ai: чат %s, вторая попытка похожа, но не дословна — "
+                            "отвечаю ей", chat_id)
+                text = second
+            elif stuck and not repeats(text, said):
+                # Сработала только защита от присказки, а сам ответ
+                # повтором не был. Молчать из-за вцепившегося оборота
+                # нельзя: в живом чате бот так пропустил подряд несколько
+                # обращений и ответил уже следующему — со стороны это
+                # выглядит как «отвечает не тому». Присказка неприятна,
+                # молчание хуже.
+                logger.info("ai: чат %s, присказка осталась — отвечаю как есть",
+                            chat_id)
+            else:
+                logger.info("ai: чат %s, повтор и со второй попытки — молчу", chat_id)
+                return []
     except Exception:
         logger.warning("ai: запрос не прошёл в чате %s", chat_id, exc_info=True)
         return []
-    # размышления срезаем ДО проверки длины: иначе простыня мыслей выглядит
-    # как слишком длинный ответ, и настоящая реплика под ней пропадала вместе
-    # с ними
-    text = strip_thoughts(text or "").strip()
     if len(text) > max(config.AI_MAX_CHARS, _length_rule(s)[1]):
         # столько в чате не пишут: это модель рассуждает вслух. Молчим.
         logger.warning("ai: ответ длиной %s знаков похож на размышления, пропускаю: %r",
@@ -685,6 +1122,39 @@ async def ask(s, chat_title: str | None, chat_id: int, asked_by: str,
     if not parts:
         logger.warning("ai: пустой ответ модели, сырой текст: %r", text[:300])
     return parts
+
+
+def _step(name: str, before: str, after: str) -> str:
+    """Записать в лог, что чистильщик сработал.
+
+    Чистильщиков накопилось шесть, и каждый добавлялся под конкретный случай
+    из чата. Часть из них наверняка уже мертва: источник мусора чинился в
+    промпте, а срезка осталась. Удалять на глаз нельзя — вернём старый баг.
+    Поэтому пишем, кто реально срабатывает, и через несколько дней смотрим:
+
+        docker logs slusha 2>&1 | grep -o "чистка: .*" | sort | uniq -c
+
+    Молчащие удаляем, остальные оставляем. Строка в лог стоит дёшево, а
+    срабатывает она только когда чистильщик и правда что-то поменял.
+    """
+    if after != before:
+        logger.info("чистка: %s", name)
+    return after
+
+async def _clean(text: str, s, self_names: list | None,
+                 question: str = "", chat_title: str = "") -> str:
+    """Ответ модели без размышлений, подписи и эха вопроса.
+
+    Размышления срезаем ДО проверки длины: иначе простыня мыслей выглядит как
+    слишком длинный ответ, и настоящая реплика под ней пропадала вместе с ними.
+    """
+    text = _step("мысли", text or "", strip_thoughts(text or "").strip())
+    text = _step("подпись", text, strip_bot_prefix(text, self_names))
+    text = _step("указание", text, strip_orders(text))
+    text = _step("кавычки", text, strip_quotes(text))
+    text = _step("эхо вопроса", text, strip_echo(text, question))
+    # название чата тоже утекает из системного промпта
+    return _step("эхо чата", text, strip_echo(text, chat_title, need_sep=True))
 
 
 def _anthropic_content(question: str, images: list[str] | None) -> list | str:
@@ -805,16 +1275,16 @@ async def _ask_ollama(system: str, messages: list[dict], tokens: int,
                       images: list[str] | None = None) -> str:
     """Нативный API Ollama.
 
-    Выключаем размышления двумя способами сразу: полем think (понимают свежие
-    версии) и пометкой /no_think в тексте (её понимает сама модель Qwen3).
-    Старые сборки Ollama первое поле игнорируют молча.
+    Размышления выключаем полем think — это штатный выключатель, и работает он
+    надёжно. Текстовую пометку /no_think сюда больше не дописываем: рядом с
+    работающим полем она ничего не добавляет, а занимает самое дорогое место —
+    хвост системного промпта и конец задания, куда модель смотрит внимательнее
+    всего. На qwen3.5:4b ответ с ней выходил суше и чаще начинался с чужой
+    подписи. Пометка осталась запасным вариантом ниже: старые сборки Ollama
+    поля think не знают.
     """
     hush = config.AI_NO_THINK and _thinking_model()
     talk = [dict(m) for m in messages]
-    if hush:
-        system += "\n/no_think"
-        if talk:
-            talk[-1]["content"] += "\n/no_think"
     _warn_if_tight(system, flatten(talk), tokens)
 
     def attach(msg, imgs):
@@ -839,8 +1309,13 @@ async def _ask_ollama(system: str, messages: list[dict], tokens: int,
     resp = await _get_client().post("/api/chat", json=body)
     if resp.status_code >= 400 and "think" in body:
         # старые сборки Ollama этого поля не знают и отвечают ошибкой
-        logger.info("ai: ollama не приняла поле think, повторяю без него")
+        # Тогда и достаём текстовую пометку: без неё думающая модель уйдёт
+        # рассуждать на весь num_predict и в чат не придёт ничего. Замер на
+        # qwen3.5:4b при потолке 400 токенов — 1294 знака мыслей, пустой ответ.
+        logger.info("ai: ollama не приняла поле think, повторяю с пометкой в тексте")
         body.pop("think")
+        body["messages"][0]["content"] += "\n/no_think"
+        body["messages"][-1]["content"] += "\n/no_think"
         resp = await _get_client().post("/api/chat", json=body)
     if resp.status_code >= 400:
         logger.warning("ai: ollama ответила %s: %s", resp.status_code, resp.text[:200])
@@ -934,7 +1409,7 @@ async def _respond(bot, message, s, who: str, text: str,
     me = await bot.me()
     myname = (me.username and f"@{me.username}") or me.full_name
     # чем бот отзывается: юзернейм, его имя и слова из «Имена-обращения»
-    self_names = [myname, me.full_name] + plain_names(s)
+    self_names = [me.full_name] + plain_names(s)
     parts = await ask(s, message.chat.title, chat_id, who, text, self_names,
                       snapshot=snapshot, reply_note=note, branch=branch,
                       images=images)

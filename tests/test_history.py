@@ -122,6 +122,19 @@ async def main():
     con.close()
     check("и в базе пусто", left == 0)
 
+    # --- 4b. одновременное первое обращение к базе ---
+    # Реакции в чате прилетают пачкой, и каждая лезет в базу своим хендлером.
+    # Без замка все они видели «соединения нет», открывали по своему и делали
+    # PRAGMA поверх чужой транзакции: SQLite отвечал «Safety level may not be
+    # changed inside a transaction», реакция терялась, в лог сыпались
+    # трейсбеки. Ровно это и было видно в боевом логе.
+    await history.close()
+    results = await asyncio.gather(
+        *[history.tail(CID, 5) for _ in range(12)], return_exceptions=True)
+    beda = [r for r in results if isinstance(r, Exception)]
+    check(f"пачка одновременных обращений не падает ({len(beda)} ошибок)", not beda)
+    check("соединение при этом одно", history._db is not None)
+
     # --- 5. миграция окна контекста ---
     await db.set_setting(CID, "ai_ctx", 20)          # как было у старых чатов
     await db.kv_set("mig_ctx50", None)               # флаг снят — миграция повторится
