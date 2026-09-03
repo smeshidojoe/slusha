@@ -343,7 +343,7 @@ async def main():
           sent["m"][1] == {"role": "assistant", "content": "дороже, чем вчера."})
     check("задание идёт последним ходом",
           sent["m"][-1]["role"] == "user"
-          and "Отвечай на эту реплику" in sent["m"][-1]["content"])
+          and "Отвечай на последнюю реплику" in sent["m"][-1]["content"])
     check("простыни <chat> больше нет", "<chat>" not in ai.flatten(sent["m"]))
 
     await db.set_setting(CID, "ai_examples", None)
@@ -409,6 +409,22 @@ async def main():
           "не повторяй" not in ai._FRAME_STYLE.lower()
           and "без списков" not in ai._FRAME_STYLE.lower())
 
+    # --- сколько своих имён показываем модели ---
+    # Ловим сообщения по всему списку, а в промпт кладём немного: длинный
+    # перечень модель зачитывает вслух и берёт слова оттуда как обращение —
+    # в чат ушло «Ты хоть понимаешь, о чём говоришь, неко?».
+    many = ["ТабаКошка", "яни", "кошка", "таба", "табакошка", "неко"]
+    shown = ai._prompt(s, "Чат", "@v", many)
+    line = next(ln for ln in shown.split("\n") if ln.startswith("Тебя зовут:"))
+    listed = [n.strip() for n in line.split(":", 1)[1].split(".")[0].split(",")]
+    check("имён в промпте не больше потолка", len(listed) == config.AI_NAMES_SHOWN)
+    check("показаны первые по порядку", listed == many[:config.AI_NAMES_SHOWN])
+    check("хвост списка в промпт не уехал", "неко" not in listed)
+    # Дубли через ё/е занимали два места из трёх: «Декамарт, вахоёб, вахоеб».
+    dbl = ai._prompt(s, "Чат", "@v", ["Декамарт", "вахоёб", "вахоеб", "дека"])
+    dline = next(ln for ln in dbl.split("\n") if ln.startswith("Тебя зовут:"))
+    check("ё и е считаются одним именем",
+          "вахоеб" not in dline.split(".")[0] and "дека" in dline)
     # --- подпись говорящего в своём же ответе ---
     # Модель видит чужие реплики как «@ник: текст» и копирует формат на себя.
     # В живом чате приходило «**@thatmossybot (Холо):** дороже, чем вчера».
@@ -630,8 +646,10 @@ async def main():
     check("двух user подряд нет",
           all(a["role"] != b["role"] for a, b in zip(msgs, msgs[1:])))
     check("задание приклеено к последней реплике",
-          "Отвечай на эту реплику" in msgs[-1]["content"]
+          "Отвечай на последнюю реплику" in msgs[-1]["content"]
           and "@vasya: как дела" in msgs[-1]["content"])
+    check("вопрос в промпте ровно один раз",
+          ai.flatten(msgs).count("как дела") == 1)
 
     # --- запас токенов думающей модели даётся всегда ---
     was_model, was_hush = config.AI_MODEL, config.AI_NO_THINK

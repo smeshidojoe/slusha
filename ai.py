@@ -144,8 +144,18 @@ def _get_client():
             if config.AI_API_KEY:
                 headers["Authorization"] = f"Bearer {config.AI_API_KEY}"
             base = _ollama_base() if kind == "ollama" else config.AI_BASE_URL
+            # К своей же машине — мимо прокси. httpx по умолчанию читает
+            # системные настройки, а на Windows это ещё и реестр, где может
+            # стоять socks4 от впн-клиента. Схему socks httpx не понимает и
+            # падает на создании клиента: «Unknown scheme for proxy URL» —
+            # то есть бот перестаёт отвечать вообще, хотя Ollama жива и
+            # слушает localhost. Для облачных провайдеров прокси оставляем:
+            # туда он как раз может быть нужен.
+            local = any(h in base for h in ("localhost", "127.0.0.1",
+                                            "host.docker.internal", "0.0.0.0"))
             _client = httpx.AsyncClient(base_url=base, headers=headers,
-                                        timeout=config.AI_TIMEOUT)
+                                        timeout=config.AI_TIMEOUT,
+                                        trust_env=not local)
     return _client
 
 
@@ -498,7 +508,18 @@ def _prompt(s, chat_title: str | None, asked_by: str,
             self_names: list | None = None) -> str:
     persona = (s.ai_persona or config.AI_PERSONA_DEFAULT).strip()
     frame = _FRAME_FREE if s.ai_free else _FRAME_STRICT
-    names = ", ".join(dict.fromkeys(n for n in (self_names or []) if n))
+    # Показываем не весь список: отзываемся мы на все имена, но длинный
+    # перечень модель зачитывает вслух и растаскивает на обращения.
+    # Дубли схлопываем по «е»: в списках обращений часто лежат оба написания
+    # одного слова, и в показанную тройку уходило «Декамарт, вахоёб, вахоеб» —
+    # два места из трёх на одно и то же.
+    seen, keys = [], set()
+    for n in (self_names or []):
+        key = (n or "").strip().lower().replace("ё", "е")
+        if key and key not in keys:
+            keys.add(key)
+            seen.append(n)
+    names = ", ".join(seen[:config.AI_NAMES_SHOWN])
     # без этого модель путается: увидев «Гремлин, привет», она решала, что
     # Гремлин — это собеседник, и отвечала «ну ты и зануда, Гремлин»
     who_am_i = (
@@ -1047,8 +1068,14 @@ async def ask(s, chat_title: str | None, chat_id: int, asked_by: str,
         task.append(reply_note)
     if images:
         task.append("К сообщению приложена картинка — посмотри на неё.")
-    # цель называем дословно: «последнюю реплику» модель понимает как хочет
-    task.append(f"Отвечай на эту реплику — {asked_by}: «{question[:400]}».\n"
+    # На реплику показываем, а не повторяем её. Раньше задание цитировало
+    # вопрос дословно — «последнюю реплику» модель понимала как хочет. Но
+    # выше эта же реплика уже дописана последней строкой переписки, а при
+    # ответе реплаем есть ещё и нота о нём: один и тот же текст доезжал до
+    # модели трижды. Маленькую модель это сбивало наповал — в чат уходило
+    # «Ну и что мне как?», начало фразы без конца. Без повтора те же вопросы
+    # получают связные ответы.
+    task.append(f"Отвечай на последнюю реплику — её написал {asked_by}.\n"
                 f"{_length_rule(s)[0].capitalize()}.")
     # задание — продолжение той же реплики, а не отдельный ход: два user
     # подряд Anthropic не принимает, да и модели понятнее одним куском
