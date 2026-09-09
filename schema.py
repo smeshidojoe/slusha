@@ -28,6 +28,8 @@ FIELDS: list[Field] = [
           config.AI_LANG_LABELS),
     Field("ai_free", "toggle", "Слушаться указаний из чата"),
     Field("ai_vision", "toggle", "Смотреть картинки"),
+    Field("ai_roleplay", "toggle", "Действия в звёздочках"),
+    Field("ai_lore", "toggle", "Книга мира"),
     Field("ai_lore_bg", "toggle", "Подмешивать лор без совпадений"),
     Field("ai_topics", "toggle", "Разделять темы форума"),
 ]

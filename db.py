@@ -41,7 +41,9 @@ CREATE TABLE IF NOT EXISTS settings(
     ai_topics   INTEGER NOT NULL DEFAULT 0,
     ai_greeting TEXT,
     ai_examples TEXT,
-    ai_lore_bg  INTEGER NOT NULL DEFAULT 1
+    ai_lore_bg  INTEGER NOT NULL DEFAULT 1,
+    ai_lore     INTEGER NOT NULL DEFAULT 1,
+    ai_roleplay INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS lore(
     id       INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -90,6 +92,11 @@ class Settings:
     ai_greeting: str | None = None
     ai_examples: str | None = None
     ai_lore_bg: int = 1
+    # книга мира целиком: выключатель, а не правка каждой записи
+    ai_lore: int = 1
+    # вставки в звёздочках: *Вздыхает*. По умолчанию режем — модель ставит
+    # их сама примерно в половине ответов, и персонажу они чаще не идут.
+    ai_roleplay: int = 0
 
 
 _FIELDS = {f.name for f in fields(Settings)} - {"chat_id"}
@@ -137,7 +144,9 @@ async def _migrate() -> None:
                        ("ai_topics", "INTEGER NOT NULL DEFAULT 0"),
                        ("ai_greeting", "TEXT"),
                        ("ai_examples", "TEXT"),
-                       ("ai_lore_bg", "INTEGER NOT NULL DEFAULT 1")):
+                       ("ai_lore_bg", "INTEGER NOT NULL DEFAULT 1"),
+                       ("ai_lore", "INTEGER NOT NULL DEFAULT 1"),
+                       ("ai_roleplay", "INTEGER NOT NULL DEFAULT 0")):
         await _add_column("settings", name, decl)
     await _db.commit()
 

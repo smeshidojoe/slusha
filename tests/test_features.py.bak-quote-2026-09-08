@@ -343,7 +343,7 @@ async def main():
           sent["m"][1] == {"role": "assistant", "content": "дороже, чем вчера."})
     check("задание идёт последним ходом",
           sent["m"][-1]["role"] == "user"
-          and "Отвечай на эту реплику" in sent["m"][-1]["content"])
+          and "Отвечай на последнюю реплику" in sent["m"][-1]["content"])
     check("простыни <chat> больше нет", "<chat>" not in ai.flatten(sent["m"]))
 
     await db.set_setting(CID, "ai_examples", None)
@@ -689,12 +689,10 @@ async def main():
     check("двух user подряд нет",
           all(a["role"] != b["role"] for a, b in zip(msgs, msgs[1:])))
     check("задание приклеено к последней реплике",
-          "Отвечай на эту реплику" in msgs[-1]["content"]
+          "Отвечай на последнюю реплику" in msgs[-1]["content"]
           and "@vasya: как дела" in msgs[-1]["content"])
-    # Реплика в промпте дважды — строкой чата и в задании. Это нарочно:
-    # одна короткая строка среди полусотни тонет, и бот отвечал фону чата.
-    check("реплика названа и в переписке, и в задании",
-          ai.flatten(msgs).count("как дела") == 2)
+    check("вопрос в промпте ровно один раз",
+          ai.flatten(msgs).count("как дела") == 1)
 
     # А длинную не повторяем: она уже стоит последней строкой переписки,
     # и дословный повтор давал модели один и тот же текст трижды.
@@ -704,11 +702,10 @@ async def main():
     await ai.ask(s, "Чат", CID, "@vasya", long_q,
                  snapshot=[Line("@vasya", long_q)])
     tail = calls[0][-1]["content"]
-    check("длинную реплику называем так же",
-          "Отвечай на эту реплику" in tail)
-    # На длинных сообщениях повтор проверяли отдельно: обрывов 0 из 6.
-    check("и она тоже названа дважды",
-          ai.flatten(calls[0]).count(long_q) == 2)
+    check("длинную реплику дословно не повторяем",
+          "Отвечай на последнюю реплику" in tail)
+    check("и в промпте она ровно одна",
+          ai.flatten(calls[0]).count(long_q) == 1)
 
     # --- запас токенов думающей модели даётся всегда ---
     was_model, was_hush = config.AI_MODEL, config.AI_NO_THINK
