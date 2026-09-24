@@ -200,6 +200,16 @@ async def main():
     await store.summary_set(CID, "Вася любит пиво.", 5)
     text, kb = await menu.view_notes(CID)
     check("экран заметок показывает их", "Вася любит пиво" in text)
+
+    # Заметки с лимитом 4000 знаков вместе с шапкой не влезали в сообщение:
+    # Telegram отказывал, а меню глотало ошибку — кнопка молча не открывалась.
+    big = "УЧАСТНИКИ:\n" + "".join(f"— @user{i} — длинное описание человека номер {i}\n" for i in range(90))
+    await store.summary_set(CID, big, 5)
+    text, kb = await menu.view_notes(CID)
+    check("длинные заметки влезают в одно сообщение", menu._tg_len(text) <= menu.TG_LIMIT)
+    check("и сказано, что показаны не целиком", "показано" in text)
+    check("обрезано по строке", "— @user" in text.split("</i>")[0].splitlines()[-1])
+    await store.summary_set(CID, "Вася любит пиво.", 5)
     await menu.cb_notes_clear(FakeCallback(f"m:sumclr:{CID}"))
     check("кнопка очистки стирает заметки",
           (await store.summary_get(CID))[0] == "")

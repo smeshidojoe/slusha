@@ -4,7 +4,6 @@
 Модерации нет вовсе — этот бот только разговаривает.
 """
 import logging
-import re
 
 from aiogram import Bot, F, Router
 from aiogram.filters import Command, CommandStart, StateFilter
@@ -17,28 +16,6 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 from . import ai, config, db, history as store, lore, schema, utils
 
 logger = logging.getLogger("slusha.menu")
-
-
-# Предел одного сообщения в Telegram — в единицах UTF-16: эмодзи идёт за два.
-TG_LIMIT = 4096
-
-
-def _tg_len(text: str) -> int:
-    """Длина текста так, как её считает Telegram — без разметки, в UTF-16."""
-    visible = re.sub(r"<[^>]+>", "", text)
-    return len(visible.encode("utf-16-le")) // 2
-
-
-def _fit_lines(text: str, room: int) -> str:
-    """Столько целых строк текста, сколько влезет в room знаков Telegram."""
-    out, used = [], 0
-    for line in text.splitlines():
-        size = _tg_len(line) + 1
-        if used + size > room:
-            break
-        out.append(line)
-        used += size
-    return "\n".join(out).rstrip()
 
 router = Router()
 router.message.filter(F.chat.type == "private")
@@ -216,19 +193,8 @@ async def view_notes(cid: int) -> tuple[str, InlineKeyboardMarkup]:
         f"(пересобирает каждые {config.AI_SUMMARY_EVERY}, потолок заметок — "
         f"{config.AI_SUMMARY_LIMIT} знаков).\n",
     ]
-    if text.strip():
-        # Экран — одно сообщение, а заметки с лимитом 4000 знаков вместе с
-        # шапкой в него не влезали: Telegram отказывал, и кнопка «Заметки»
-        # молча переставала открываться. Показываем столько целых строк,
-        # сколько помещается; сами заметки при этом не трогаем.
-        room = TG_LIMIT - _tg_len("\n".join(lines)) - 120
-        shown = _fit_lines(text, room)
-        lines.append(f"<i>{utils.esc(shown)}</i>")
-        if len(shown) < len(text.strip()):
-            lines.append(f"\n<i>… показано {len(shown)} из {len(text.strip())} знаков. "
-                         "Бот при этом помнит заметки целиком.</i>")
-    else:
-        lines.append("Пока пусто — бот ещё не набрал материала.")
+    lines.append(f"<i>{utils.esc(text)}</i>" if text.strip()
+                 else "Пока пусто — бот ещё не набрал материала.")
 
     b = InlineKeyboardBuilder()
     if text.strip():
@@ -323,13 +289,8 @@ async def _show(cb: CallbackQuery, view: tuple[str, InlineKeyboardMarkup],
     text, kb = view
     try:
         await cb.message.edit_text(text, reply_markup=kb)
-    except Exception as e:
-        # «Сообщение не изменилось» — нормально, нажали ту же кнопку ещё раз.
-        # А всё прочее раньше глоталось так же молча: экран заметок перестал
-        # открываться из-за длины, и в логе не было ни строчки.
-        if "not modified" not in str(e):
-            logger.warning("меню: экран не показан: %s", e)
-            note = note or "Не получилось показать этот экран."
+    except Exception:
+        pass          # ничего не изменилось — Telegram ругается, нам всё равно
     await cb.answer(note)
 
 

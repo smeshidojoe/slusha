@@ -96,11 +96,7 @@ async def fake_model(system, question, tokens=0, images=None):
     from slusha import ai
     text = ai.flatten(question) if isinstance(question, list) else question
     ASKED.append((system, text, tokens))
-    return ("УЧАСТНИКИ:\n— @vasya — Вася — за пивом.\n— @petya — Петя всегда пас.\n"
-            "ДОГОВОРЁННОСТИ И СОБЫТИЯ:\n—\n"
-            "ШУТКИ И ПРОЗВИЩА:\n— Шутка про овощехранилище.\n"
-            "ФАКТЫ О ТЕБЕ:\n—\n"
-            "СЕЙЧАС ОБСУЖДАЮТ:\n— пиво.")
+    return "Вася — за пивом. Петя всегда пас. Шутка про овощехранилище."
 
 
 async def main():
@@ -156,11 +152,8 @@ async def main():
     check("модель просили именно пересказать", "заметки" in ASKED[-1][0].lower())
     check("каркас разделов задан",
           all(name in ASKED[-1][0] for name in summary._SECTIONS))
-    # Формат и чистку списка задаём утвердительно: запреты с «не» маленькая
-    # модель читает как подсказку и воспроизводит перечисленное.
-    check("формат задан утвердительно", "простой текст" in ASKED[-1][0])
-    check("лишних людей велено вычёркивать", "вычёркивай" in ASKED[-1][0])
-    check("у каждого раздела свой потолок", "до двенадцати" in ASKED[-1][0])
+    check("markdown запрещён явно", "markdown" in ASKED[-1][0].lower())
+    check("мёртвые строки запрещены явно", "не упоминался" in ASKED[-1][0])
     check("в пересказ уехали реплики чата", "реплика 3" in ASKED[-1][1])
 
     block = await summary.block(CID)
@@ -217,80 +210,12 @@ async def main():
 
     # --- 6. слишком длинные заметки режутся ---
     async def verbose(system, question, tokens=0, images=None):
-        head = "".join(f"{name}:\n— коротко\n" for name in summary._SECTIONS[1:])
-        return head + "УЧАСТНИКИ:\n" + "".join(
-            f"— @user{i} — очень подробно про всё на свете\n" for i in range(400))
+        return "очень подробно. " * 1000
 
     ai._ask_ollama = verbose
     await summary._compact(CID)
     text, _ = await store.summary_get(CID)
     check("заметки обрезаны до потолка", 0 < len(text) <= config.AI_SUMMARY_LIMIT)
-    check("и обрезаны по строке, а не посреди слова",
-          text.endswith("на свете") or text.endswith("—"))
-
-    # --- 6а. битые заметки не сохраняем ---
-    # От пяти разделов оставался один, а хвост становился сырой перепиской.
-    # Такие заметки уходили на вход следующей пересборке, и порча копилась.
-    before, _ = await store.summary_get(CID)
-
-    async def broken(system, question, tokens=0, images=None):
-        return "УЧАСТНИКИ:\n— @vasya — пьёт\n@vasya: привет\n@petya: ку\n@kolya: йо\n@misha: ага"
-
-    ai._ask_ollama = broken
-    for _ in range(4):
-        await store.add(CID, "@vasya", "ещё реплика")
-    await summary._compact(CID)
-    after, _ = await store.summary_get(CID)
-    check("заметки без разделов не записаны", after == before)
-    check("и сырая переписка в заметки не попадает",
-          bool(summary._defect("УЧАСТНИКИ:\n" + "@a: б\n" * 5)))
-
-    # --- 6б. список участников: потолок, слияние повторов, свежие вперёд ---
-    # Модель переписывала старый список целиком и дописывала новых: 19 строк,
-    # один человек трижды. Раздутый список съел бы лимит и последний раздел.
-    tail = "".join(f"{n}:\n—\n" for n in summary._SECTIONS[1:])
-    many = "УЧАСТНИКИ:\n" + "".join(f"— @u{i} — что-то\n" for i in range(20)) + tail
-    trimmed = summary._trim_people(many)
-    nicks = [ln for ln in trimmed.splitlines() if ln.startswith("— @")]
-    check("участников не больше потолка", len(nicks) == summary.PEOPLE_MAX)
-    check("остальные разделы целы", all(f"{n}:" in trimmed for n in summary._SECTIONS))
-
-    # Новое о человеке модель пишет второй строкой ниже старой. Раньше
-    # оставалась первая — и новое терялось ровно тогда, когда появлялось.
-    dup = ("УЧАСТНИКИ:\n— @vasya — пьёт пиво\n— @petya — молчит\n"
-           "— @vasya — купил велосипед\n" + tail)
-    merged = summary._trim_people(dup)
-    vasya = [ln for ln in merged.splitlines() if "@vasya" in ln]
-    check("человек остался одной строкой", len(vasya) == 1)
-    check("новое о нём не потерялось", "велосипед" in vasya[0])
-    check("и старое тоже", "пиво" in vasya[0])
-    check("свежее идёт первым", vasya[0].index("велосипед") < vasya[0].index("пиво"))
-
-    # Новичков модель дописывает в конец. При полном списке их отрезало,
-    # и в память не попадал никто из тех, кто только что пришёл.
-    full = "УЧАСТНИКИ:\n" + "".join(f"— @old{i} — давно\n" for i in range(12))
-    full += "— @newbie — только пришёл\n" + tail
-    kept = summary._trim_people(full, recent={"@newbie"})
-    check("писавший только что попадает в полный список", "@newbie" in kept)
-    check("а потолок всё равно соблюдён",
-          sum(ln.startswith("— @") for ln in kept.splitlines()) == summary.PEOPLE_MAX)
-
-    # Слитая строка тоже не бесконечная.
-    long_dup = "УЧАСТНИКИ:\n" + "".join(f"— @vasya — факт номер {i}\n" for i in range(60)) + tail
-    line = [ln for ln in summary._trim_people(long_dup).splitlines() if "@vasya" in ln][0]
-    check("слитая строка укладывается", len(line) <= summary.PERSON_CHARS + 20)
-    # --- 6в. заметки в markdown приводятся к одной форме ---
-    # Модель копирует оформление прошлых заметок. Раз съехав в «**Участники:**»,
-    # она держалась его, проверка не находила разделов и браковала всё подряд.
-    md = ("**Участники:**\n*   detective\\_official: Драматичный\n"
-          "**О чём договорились/обсуждали:**\n*   спорят\n"
-          "**Шутки и прозвища:**\n*   нет\n**Факты о тебе:**\n*   зовут Холо\n"
-          "**Сейчас обсуждают:**\n*   погода")
-    norm = summary._normalize(md)
-    check("markdown-заметки узнаются", summary._defect(norm) == "")
-    check("человек в старом оформлении стал строкой с ником",
-          "— @detective_official — Драматичный" in norm)
-    check("звёздочки-маркеры стали тире", "*" not in norm)
 
     # --- 7. «забыть переписку» стирает и заметки ---
     await ai.forget(CID)
