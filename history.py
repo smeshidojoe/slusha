@@ -74,6 +74,18 @@ CREATE TABLE IF NOT EXISTS ai_summary(
     covered_id INTEGER NOT NULL DEFAULT 0,
     updated_at INTEGER NOT NULL
 );
+-- Память о людях: строка на человека. Раньше люди жили внутри заметок, и
+-- заметки целиком уходили в каждый промпт — поэтому их держали впритык к
+-- двенадцати людям. Отдельно в промпт берём только тех, кто сейчас в
+-- разговоре, и помнить можно сколько угодно народу.
+CREATE TABLE IF NOT EXISTS ai_people(
+    chat_id    INTEGER NOT NULL,
+    key        TEXT    NOT NULL,
+    who        TEXT    NOT NULL,
+    text       TEXT    NOT NULL,
+    updated_at INTEGER NOT NULL,
+    PRIMARY KEY (chat_id, key)
+);
 CREATE TABLE IF NOT EXISTS meta(
     k TEXT PRIMARY KEY,
     v TEXT
@@ -204,6 +216,7 @@ async def clear(chat_id: int) -> int:
     db = await _conn()
     cur = await db.execute("DELETE FROM ai_history WHERE chat_id = ?", (chat_id,))
     await db.execute("DELETE FROM ai_summary WHERE chat_id = ?", (chat_id,))
+    await db.execute("DELETE FROM ai_people WHERE chat_id = ?", (chat_id,))
     await db.commit()
     _since_prune.pop(chat_id, None)
     return cur.rowcount or 0
@@ -266,10 +279,81 @@ async def summary_set(chat_id: int, text: str, covered_id: int) -> None:
 
 
 async def summary_clear(chat_id: int) -> bool:
+    """Стереть заметки вместе с памятью о людях: это одна память."""
     db = await _conn()
     cur = await db.execute("DELETE FROM ai_summary WHERE chat_id = ?", (chat_id,))
+    gone = await db.execute("DELETE FROM ai_people WHERE chat_id = ?", (chat_id,))
     await db.commit()
-    return bool(cur.rowcount)
+    return bool(cur.rowcount or gone.rowcount)
+
+
+# ---------- память о людях ----------
+
+# Сколько людей помним на чат. В промпт их уходит несколько, так что потолок
+# тут только от разрастания базы: вытесняются те, о ком дольше всех молчат.
+PEOPLE_KEEP = 500
+
+
+def person_key(who: str) -> str:
+    """Ключ человека: ник без учёта регистра — модель пишет его как попало."""
+    return who.strip().lower()
+
+
+async def people_get(chat_id: int, whos) -> list[tuple[str, str]]:
+    """Записи о названных людях, в том же порядке. О ком ничего нет — пропуск."""
+    keys = []
+    for who in whos:
+        k = person_key(who)
+        if k and k not in keys:
+            keys.append(k)
+    if not keys:
+        return []
+    db = await _conn()
+    marks = ",".join("?" * len(keys))
+    cur = await db.execute(
+        f"SELECT key, who, text FROM ai_people WHERE chat_id = ? AND key IN ({marks})",
+        (chat_id, *keys),
+    )
+    found = {r["key"]: (r["who"], r["text"]) for r in await cur.fetchall()}
+    return [found[k] for k in keys if k in found]
+
+
+async def people_all(chat_id: int) -> list[tuple[str, str]]:
+    """Все, кого помним, — свежие первыми."""
+    db = await _conn()
+    cur = await db.execute(
+        "SELECT who, text FROM ai_people WHERE chat_id = ? ORDER BY updated_at DESC, who",
+        (chat_id,),
+    )
+    return [(r["who"], r["text"]) for r in await cur.fetchall()]
+
+
+async def people_count(chat_id: int) -> int:
+    db = await _conn()
+    cur = await db.execute("SELECT COUNT(*) AS c FROM ai_people WHERE chat_id = ?",
+                           (chat_id,))
+    return (await cur.fetchone())["c"]
+
+
+async def people_set(chat_id: int, people) -> None:
+    """Записать или обновить людей: [(ник, описание)]. Лишних старых — вытеснить."""
+    now = int(time.time())
+    db = await _conn()
+    await db.executemany(
+        """INSERT INTO ai_people (chat_id, key, who, text, updated_at)
+           VALUES (?,?,?,?,?)
+           ON CONFLICT(chat_id, key) DO UPDATE SET
+               who = excluded.who, text = excluded.text,
+               updated_at = excluded.updated_at""",
+        [(chat_id, person_key(who), who, text, now) for who, text in people],
+    )
+    await db.execute(
+        """DELETE FROM ai_people WHERE chat_id = ? AND key NOT IN
+               (SELECT key FROM ai_people WHERE chat_id = ?
+                ORDER BY updated_at DESC LIMIT ?)""",
+        (chat_id, chat_id, PEOPLE_KEEP),
+    )
+    await db.commit()
 
 
 async def pending(chat_id: int, covered_id: int) -> int:

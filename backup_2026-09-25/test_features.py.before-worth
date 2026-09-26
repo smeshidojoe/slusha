@@ -167,27 +167,6 @@ async def main():
     await ai.remember(CID, "@petya", "я пойду", 4)
     check("прошло два чужих — снова думает",
           await ai.should_reply(bot, msg("я пойду"), s))
-    # в чужой реплай-разговор — только в реплику с содержанием
-    asked = verdict["asked"]
-    human = SimpleNamespace(from_user=SimpleNamespace(id=8, username="petya",
-                                                      full_name="Петя"),
-                            text="я пойду", caption=None, message_id=4)
-    await ai.remember(CID, "@kolya", "обязательно тоже пойду", 5, 4)
-    check("короткий реплай человеку — не влезает",
-          not await ai.should_reply(bot, msg("обязательно тоже пойду", mid=5, reply=human), s)
-          and verdict["asked"] == asked)
-    await ai.remember(CID, "@kolya", "а можно с вами сходить", 6)
-    check("короткое продолжение чужого реплая — тоже нет",
-          not await ai.should_reply(bot, msg("а можно с вами сходить", mid=6), s)
-          and verdict["asked"] == asked)
-    long = "а давайте лучше в тот бар на набережной, там пиво дешевле"
-    await ai.remember(CID, "@kolya", long, 7)
-    check("реплика с содержанием в чужом разговоре — судья думает",
-          await ai.should_reply(bot, msg(long, mid=7), s) and verdict["asked"] == asked + 1)
-    await ai.remember(CID, "@petya", "кто вообще за пиво сегодня", 8, 7)
-    await ai.remember(CID, "@vasya", "ну я схожу, пожалуй", 9, 9)
-    check("реплай самому себе — не разговор",
-          await ai.should_reply(bot, msg("ну я схожу, пожалуй", mid=9), s))
     ai._last_reply[CID] = __import__("time").time()
     check("в кулдаун судью не спрашиваем",
           not await ai.should_reply(bot, msg("я пойду"), s))

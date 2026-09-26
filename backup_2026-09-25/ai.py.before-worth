@@ -443,46 +443,7 @@ async def should_reply(bot, message, s) -> bool:
     rows = await history(message.chat.id, config.AI_HISTORY)
     if _quiet_for(rows) < gap(s.ai_random):
         return False                     # говорил недавно — даём чату пожить
-    if not _worth_joining(text, rows):
-        return False                     # обрывок чужого диалога — ждём реплику с темой
     return await _decide(bot, message, s, text, to_bot=False)
-
-
-# Сколько секунд подряд идущие сообщения одного автора считаем одной репликой.
-_BURST = 180
-# Столько слов нужно реплике из чужого разговора, чтобы в неё влезть.
-_DIALOG_WORDS = 6
-_LETTERS = re.compile(r"[^\W\d_]+")
-
-
-def _in_dialog(rows) -> bool:
-    """Автор последних сообщений разговаривает реплаями с кем-то из людей.
-
-    Смотрим и соседние сообщения того же автора: спор часто продолжают
-    отдельными строками уже без реплая. Реплай самому себе и боту — не то.
-    """
-    if not rows:
-        return False
-    last = rows[-1]
-    author = {r.msg_id: r.who for r in rows if r.msg_id}
-    for row in reversed(rows):
-        if row.who != last.who or (last.ts and row.ts and last.ts - row.ts > _BURST):
-            break
-        if row.reply_to and author.get(row.reply_to) not in (last.who, SELF):
-            return True
-    return False
-
-
-def _worth_joining(text: str, rows) -> bool:
-    """Есть ли в реплике за что зацепиться, если влезать самому.
-
-    Обрывок чужого диалога — «в манйкрафт», «ну прости», «зачем он тебе» —
-    судья принимал за реплику всему чату, а модель, не зная, о чём речь,
-    отвечала общей фразой из характера: «В манки, идиот», «Он — ошибка».
-    На реплику с темой — сосиски, рисование ради денег — ответы по делу.
-    Поэтому в чужом разговоре ждём реплику подлиннее, а не молчим совсем.
-    """
-    return not _in_dialog(rows) or len(_LETTERS.findall(text)) >= _DIALOG_WORDS
 
 
 # ---------- судья: отвечать ли ----------

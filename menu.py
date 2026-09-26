@@ -124,7 +124,10 @@ async def view_chat(cid: int) -> tuple[str, InlineKeyboardMarkup]:
     ex = len([r for r in (s.ai_examples or "").split("\n") if r.strip()])
     names = len([n for n in (s.ai_names or "").split(",") if n.strip()])
     kept, _ = await store.summary_get(cid)
+    folks = await store.people_count(cid)
     notes = f"{len(kept)} знаков" if kept.strip() else "пока нет"
+    if folks:
+        notes += f", людей: {folks}"
 
     lines = [
         f"<b>🧠 {utils.esc(ch['title'] if ch else str(cid))}</b>",
@@ -202,36 +205,46 @@ async def view_lore(cid: int, page: int = 0) -> tuple[str, InlineKeyboardMarkup]
 
 async def view_notes(cid: int) -> tuple[str, InlineKeyboardMarkup]:
     """Что бот запомнил о чате сверх окна контекста."""
+    from . import summary
+    await summary.block(cid)          # старые заметки с людьми внутри — разложить
     text, covered = await store.summary_get(cid)
+    people = await store.people_all(cid)
     left = await store.pending(cid, covered)
     when = await store.summary_updated(cid)
     lines = [
         "<b>🧠 Заметки о чате</b>\n",
         "Окно контекста помнит только последние сообщения. Всё, что уехало "
         "за его край, бот время от времени пересказывает себе сюда: кто есть "
-        "кто, о чём договорились, какие шутки прижились. Заметки уходят в "
-        "каждый запрос как справка.\n",
+        "кто, о чём договорились, какие шутки прижились. Общие заметки уходят "
+        "в каждый запрос как справка, а из людей — только те, кто сейчас "
+        f"в разговоре (до {config.AI_PROMPT_PEOPLE}).\n",
         (f"Обновлено: <b>{utils.stamp(when)}</b>\n" if when else ""),
         f"Новых сообщений с прошлой пересборки: <b>{left}</b> "
         f"(пересобирает каждые {config.AI_SUMMARY_EVERY}, потолок заметок — "
         f"{config.AI_SUMMARY_LIMIT} знаков).\n",
     ]
+    # Люди — первыми и свежие вперёд: их записи меняются чаще всего.
+    full = ""
+    if people:
+        full = f"ЛЮДИ ({len(people)}):\n" + "\n".join(f"— {w} — {d}" for w, d in people)
     if text.strip():
+        full = (full + "\n\n" + text.strip()).strip()
+    if full:
         # Экран — одно сообщение, а заметки с лимитом 4000 знаков вместе с
         # шапкой в него не влезали: Telegram отказывал, и кнопка «Заметки»
         # молча переставала открываться. Показываем столько целых строк,
         # сколько помещается; сами заметки при этом не трогаем.
         room = TG_LIMIT - _tg_len("\n".join(lines)) - 120
-        shown = _fit_lines(text, room)
+        shown = _fit_lines(full, room)
         lines.append(f"<i>{utils.esc(shown)}</i>")
-        if len(shown) < len(text.strip()):
-            lines.append(f"\n<i>… показано {len(shown)} из {len(text.strip())} знаков. "
+        if len(shown) < len(full):
+            lines.append(f"\n<i>… показано {len(shown)} из {len(full)} знаков. "
                          "Бот при этом помнит заметки целиком.</i>")
     else:
         lines.append("Пока пусто — бот ещё не набрал материала.")
 
     b = InlineKeyboardBuilder()
-    if text.strip():
+    if full:
         b.row(InlineKeyboardButton(text="🗑 Очистить заметки",
                                    callback_data=f"m:sumclr:{cid}", style="danger"))
     b.row(_btn("⬅️ Назад", f"m:c:{cid}"))

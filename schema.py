@@ -16,10 +16,10 @@ class Field:
 
 FIELDS: list[Field] = [
     Field("ai_on", "toggle", "Статус"),
-    Field("ai_random", "cycle", "Шанс влезть в разговор, %",
-          list(config.AI_RANDOM_PRESETS)),
-    Field("ai_reply", "cycle", "Шанс ответить на ответ себе, %",
-          list(config.AI_REPLY_PRESETS)),
+    Field("ai_random", "cycle", "Влезать в разговор",
+          list(config.AI_RANDOM_PRESETS), config.AI_RANDOM_LABELS),
+    Field("ai_reply", "cycle", "Отвечать на ответ себе",
+          list(config.AI_REPLY_PRESETS), config.AI_REPLY_LABELS),
     Field("ai_ctx", "cycle", "Сообщений в контексте", list(config.AI_CTX_PRESETS)),
     Field("ai_daily", "cycle", "Ответов в сутки", list(config.AI_DAILY_PRESETS)),
     Field("ai_len", "cycle", "Длина ответа", list(config.AI_LEN_PRESETS),
@@ -37,10 +37,11 @@ FIELDS: list[Field] = [
 BY_KEY = {f.key: f for f in FIELDS}
 
 INTRO = (
-    "<i>Как отвечает:</i> всегда на упоминание по имени; на ответ себе — со "
-    "своим шансом, иначе разговор вырождается в пинг-понг вдвоём; на всё "
-    "остальное — с общим шансом влезть. Между ответами пауза, в сутки не "
-    "больше лимита.\n"
+    "<i>Как отвечает:</i> всегда на упоминание по имени. На ответ себе и на "
+    "прочие сообщения решает модель — по смыслу переписки. «Влезать в "
+    "разговор» — как часто он вообще задумывается: не раньше, чем пройдёт "
+    "столько чужих сообщений после его реплики. Между ответами пауза, в сутки "
+    "не больше лимита.\n"
     "<i>Характер</i> — инструкция модели: кто он и как говорит. Можно прислать "
     "карточку персонажа с chub.ai файлом.\n"
     "<i>Лорбук</i> — справка о мире: записи просыпаются по ключевым словам.\n"

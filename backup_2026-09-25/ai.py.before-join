@@ -15,7 +15,6 @@
 import asyncio
 import difflib
 import logging
-import random
 import re
 import time
 from collections import deque
@@ -65,6 +64,12 @@ _FRAME_FREE = (
     "заговорить иначе — соглашайся и играй. Наказания при этом остаются вне "
     "твоих рук, и админом ты себя не называешь."
 )
+
+# Фото без подписи, которое не скачалось. Без «не»: на запретах маленькая
+# модель спотыкается и описывает картинку, которой не видела.
+_BLIND = ("Фото из этого сообщения потерялось при загрузке, и разглядеть его тебе "
+          "нечем. Скажи собеседнику одной фразой в своём характере, что картинка "
+          "потерялась, и попроси прислать её ещё раз.")
 
 # Примеры реплик из карточки идут первыми ходами диалога, и без пояснения
 # модель принимает их за настоящий разговор и отвечает прямо на них.
@@ -399,17 +404,16 @@ async def addressed(bot, message, s) -> bool:
 
 
 async def wanted(bot, message, s) -> bool:
-    """Обратились к боту и он решил ответить.
+    """Голое фото: звали ли бота так, чтобы ответить.
 
-    Имя — всегда: человек позвал по имени, молчать глупо. А вот реплай — с
-    настроенным шансом (`ai_reply`). Раньше бот отвечал на каждый ответ себе,
-    и разговор вырождался в бесконечный пинг-понг: человек отвечает боту, бот
-    обязательно отвечает человеку, тот снова боту — и чат занят ими двоими.
+    Судью здесь не спрашиваем — картинку он не видит, а подпись пустая, решать
+    ему не по чему. Фото в ответ боту — это обращение, если реплаи вообще
+    включены.
     """
     if await called_by_name(bot, message, s):
         return True
     if await replied_to(bot, message):
-        return random.randrange(100) < getattr(s, "ai_reply", 35)
+        return getattr(s, "ai_reply", 50) > 0
     return False
 
 
@@ -426,16 +430,163 @@ async def should_reply(bot, message, s) -> bool:
     if await called_by_name(bot, message, s):
         return True
     if await replied_to(bot, message):
-        # свой шанс, и на случайный он не проваливается: иначе один и тот же
-        # ответ боту проходил бы два броска подряд и шанс оказывался выше
-        # выставленного
-        return random.randrange(100) < getattr(s, "ai_reply", 35)
-    if not s.ai_random:
+        # на реплай боту решаем отдельно и в «влезть в разговор» не
+        # проваливаемся: это разные вопросы
+        level = getattr(s, "ai_reply", 50)
+        if level <= 0:
+            return False
+        if level >= 100 or "?" in text:
+            return True                  # на вопрос себе отвечаем без судьи
+        return await _decide(bot, message, s, text, to_bot=True)
+    if not s.ai_random or noisy(text):
+        return False                     # на «ага» влезать незачем
+    rows = await history(message.chat.id, config.AI_HISTORY)
+    if _quiet_for(rows) < gap(s.ai_random):
+        return False                     # говорил недавно — даём чату пожить
+    return await _decide(bot, message, s, text, to_bot=False)
+
+
+# ---------- судья: отвечать ли ----------
+#
+# Раньше решал кубик: на реплай боту — `ai_reply` процентов, на прочее —
+# `ai_random`. Кубик смыслу не учён: бот влезал в чужой разговор посреди
+# фразы и молчал на вопрос, брошенный всему чату. Теперь кандидата смотрит
+# модель — коротким отдельным запросом, одно слово или цифра в ответ.
+#
+# Ползунки остались ограничителями. `ai_random` — болтливость: сколько чужих
+# сообщений должно пройти после его последней реплики, прежде чем он вообще
+# задумается, влезать ли. `ai_reply` — 0 молчать на реплаи, 100 отвечать на
+# все, между ними решает судья.
+
+# «Влезать ли» спрашиваем не «да или нет», а «кому адресовано». Вопрос
+# «вставить ли тебе реплику» 4B-модель решала по характеру, а не по
+# переписке: Холо «рада людям» и говорила ДА на 37 сообщений из 38, ленивая
+# ТабаКошка при строгой формулировке — НЕТ на 40 из 40. Кому адресовано —
+# вопрос про переписку, характер тут ни при чём: на реальных чатах всех трёх
+# ботов «разговор людей между собой» вышел в 65–85% сообщений. Туда бот
+# теперь и не лезет, а кубик влезал куда попало.
+_JUDGE_WHO = (
+    "Ты читаешь переписку Telegram-чата. В чате есть бот {name}, его реплики "
+    "подписаны «{self}».\n"
+    "Определи, кому адресовано последнее сообщение, и ответь одной цифрой:\n"
+    "1 — боту {name}: его зовут, спрашивают или говорят о нём;\n"
+    "2 — всему чату: вопрос в воздух, просьба совета, новая тема для всех;\n"
+    "3 — конкретному человеку или продолжение разговора между людьми, "
+    "реакция, смех, стикер."
+)
+_WHO_ASK = "Ответь одной цифрой."
+_JOIN = re.compile(r"[123]")
+# Первая редакция («отвечаешь, когда вопрос, шутка…; промолчать, когда закрыл
+# тему») на реальной переписке молчала на «я люблю тебя, Коул» и на «Пошли
+# курить?»: у ТабаКошки ДА вышло 2 из 16. Маленькая модель тянется к «нет»,
+# поэтому «да» здесь — правило, а «нет» — узкое исключение: стало 12 из 16.
+_JUDGE_REPLY = (
+    "Собеседник ответил на твоё сообщение. Почти всегда это повод ответить: "
+    "вопрос, подкол, грубость, шутка, комплимент, спор, новая мысль — на всё "
+    "это ДА. НЕТ — только когда он коротко закрыл тему: «ок», «спасибо», "
+    "«понял», «ясно» или одним смайлом."
+)
+_JUDGE_ASK = "Ответь одним словом: ДА или НЕТ."
+_YES = re.compile(r"^\W*(да|yes)\b", re.IGNORECASE)
+
+# чаты, где судья уже думает: второй запрос параллельно только займёт
+# видеокарту, а ответить бот всё равно успеет один раз
+_judging: set[int] = set()
+
+
+def gap(level: int) -> int:
+    """Сколько чужих сообщений ждать после своей реплики при болтливости level."""
+    return -(-100 // level) if level > 0 else 10 ** 9
+
+
+def _quiet_for(rows) -> int:
+    """Сколько сообщений подряд с конца написано не ботом."""
+    count = 0
+    for row in reversed(rows):
+        if row.who == SELF:
+            break
+        count += 1
+    return count
+
+
+def _shown_names(self_names) -> list[str]:
+    seen, keys = [], set()
+    for n in (self_names or []):
+        key = (n or "").strip().lower().replace("ё", "е")
+        if key and key not in keys:
+            keys.add(key)
+            seen.append(n.strip())
+    return seen[:config.AI_NAMES_SHOWN]
+
+
+def _judge_prompt(s, self_names, to_bot: bool) -> str:
+    names = _shown_names(self_names)
+    if not to_bot:
+        # только имя, которым бот подписан: прозвища вроде «кошка» модель
+        # находила в каждом втором сообщении и считала его обращением к боту —
+        # ДА выходило на половину переписки вместо трети
+        return _JUDGE_WHO.format(name=names[0] if names else "бот", self=SELF)
+    persona = (s.ai_persona or config.AI_PERSONA_DEFAULT).strip()
+    if len(persona) > config.AI_JUDGE_PERSONA:
+        persona = persona[:config.AI_JUDGE_PERSONA].rsplit(" ", 1)[0] + "…"
+    who_am_i = f"Тебя зовут: {', '.join(names)}.\n" if names else ""
+    return (f"{persona}\n\nТы участник Telegram-чата. {who_am_i}"
+            f"В переписке твои реплики подписаны «{SELF}».\n{_JUDGE_REPLY}\n{_JUDGE_ASK}")
+
+
+def _judge_log(rows) -> str:
+    known = {r.msg_id: r for r in rows if r.msg_id}
+    out, prev = [], None
+    for row in rows:
+        if taboo(row.text):
+            continue
+        body = row.text[:300].replace("\n", " ")
+        out.append(_speaker(row, known, prev) + body)
+        prev = row
+    return "\n".join(out)
+
+
+async def judge(s, chat_id: int, rows, self_names=None, to_bot: bool = False) -> bool:
+    """Стоит ли отвечать на последнее сообщение rows. Сбой — молчим."""
+    if not rows:
         return False
-    # на шуме шанс режем, но не обнуляем: изредка влезть в «ага» — это живо,
-    # делать это в каждом третьем случае — навязчиво
-    scale = config.NOISE_DAMP if noisy(text) else 1
-    return random.randrange(100 * scale) < s.ai_random
+    tokens = config.AI_JUDGE_TOKENS + (
+        config.AI_THINKING_RESERVE if _reserve_needed() else 0)
+    last = rows[-1].who
+    ask = (f"Последнее сообщение — от {last}. {_JUDGE_ASK}" if to_bot else
+           f"Кому адресовано последнее сообщение — от {last}? {_WHO_ASK}")
+    question = f"Переписка:\n{_judge_log(rows)}\n\n{ask}"
+    try:
+        out = await raw(_judge_prompt(s, self_names, to_bot), question, tokens)
+    except Exception:
+        logger.warning("ai: судья в чате %s упал", chat_id, exc_info=True)
+        return False
+    out = strip_thoughts(out or "").strip()
+    if to_bot:
+        return bool(_YES.match(out))
+    got = _JOIN.search(out)
+    return got is not None and got.group(0) in "12"   # боту или всему чату
+
+
+async def _decide(bot, message, s, text: str, to_bot: bool) -> bool:
+    """Спросить судью, если пора и если он свободен."""
+    chat_id = message.chat.id
+    if not _ready(chat_id) or chat_id in _judging:
+        return False
+    if capped() and await spent_today(chat_id) >= s.ai_daily:
+        return False
+    _judging.add(chat_id)
+    try:
+        thread = thread_of(message) if s.ai_topics else None
+        rows = await history(chat_id, config.AI_JUDGE_CTX, thread)
+        me = await bot.me()
+        yes = await judge(s, chat_id, rows, [me.full_name] + plain_names(s), to_bot)
+    finally:
+        _judging.discard(chat_id)
+    logger.info("ai: чат %s, судья (%s): %s — «%s»", chat_id,
+                "реплай" if to_bot else "влезть", "ДА" if yes else "нет",
+                text[:60].replace("\n", " "))
+    return yes
 
 
 def _ready(chat_id: int) -> bool:
@@ -533,7 +684,8 @@ def _prompt(s, chat_title: str | None, asked_by: str,
         f"Объём ответа: {_length_rule(s)[0]}.\n"
         f"{frame}\n\n{who_am_i}{note}"
         f"Чат: «{chat_title or 'без названия'}». Сейчас к тебе обращается "
-        f"{asked_by} — если называешь собеседника по имени, то только так."
+        f"{asked_by} — если называешь собеседника по имени, то только так. "
+        f"К людям обращаешься на «ты» или по нику."
     )
 
 
@@ -695,6 +847,34 @@ def strip_actions(text: str) -> str:
     out = re.sub(r" +([,.!?…:;])", r"\1", out)
     out = re.sub(r"([.…!?]) *(?:[.…!?] *)+", r"\1 ", out)
     return out.strip()
+
+# Сексуализация детей. Бот не отвечает на это ни в какой форме — ни всерьёз, ни
+# шуткой. В живом чате его на это подначивали, и на «Любишь ЦП?» он выдал «Не
+# люблю. Но в теории — неплохо», а на постороннюю реплику сам вставил «цп».
+# Характер и рамка тут не защита — модель может их не послушаться, поэтому
+# фильтр в коде.
+_TABOO = re.compile(
+    r"\b(цп|cp)\b"
+    r"|детск\w*\s+порн|порн\w*\s+(?:с\s+)?(?:детьми|детей|малолет\w*|школьниц\w*)"
+    r"|педофил|малолетк|\bлоли\b|лоликон",
+    re.IGNORECASE,
+)
+# «ЦП» — это ещё и центральный процессор. Рядом со словами про железо не трогаем.
+_HARDWARE = re.compile(
+    r"процессор|intel|amd|ryzen|ядер|ядра|ядро|ггц|ghz|сокет|видеокарт|оперативк"
+    r"|разгон|кулер|материнк|сборк|\bпк\b|компьютер|ноутбук",
+    re.IGNORECASE,
+)
+
+
+def taboo(text: str) -> bool:
+    """Касается ли текст сексуализации детей. Такое бот не видит и не пишет."""
+    m = _TABOO.search(text or "")
+    if not m:
+        return False
+    if m.group(0).lower() in ("цп", "cp") and _HARDWARE.search(text):
+        return False
+    return True
 
 def strip_orders(text: str) -> str:
     """Убрать указание из промпта, если модель выдала его за реплику.
@@ -1065,6 +1245,12 @@ async def ask(s, chat_title: str | None, chat_id: int, asked_by: str,
     которые в чат успевают написать ещё, и бот отвечал уже не тому.
     """
     rows = list(snapshot if snapshot is not None else await history(chat_id, s.ai_ctx))
+    if taboo(question):
+        logger.info("ai: чат %s, запретная тема в сообщении — молчу", chat_id)
+        return []
+    # Такие строки модель не видит вовсе: иначе соседняя реплика вроде «это если
+    # не хочешь 12 лет строгача» всё равно читалась в том же смысле.
+    rows = [r for r in rows if not taboo(r.text)]
     # целевая реплика уже лежит в истории последней строкой — второй раз
     # не добавляем, иначе модель видит её дважды и считает повтором
     tail = Line(asked_by, question[:LINE_MAX])
@@ -1073,7 +1259,10 @@ async def ask(s, chat_title: str | None, chat_id: int, asked_by: str,
 
     system = _prompt(s, chat_title, asked_by, self_names)
     from . import lore, summary
-    notes = await summary.block(chat_id)        # заметки о чате из прошлых разговоров
+    # заметки о чате из прошлых разговоров — и записи только о тех людях,
+    # кто сейчас в разговоре: память о всех сразу в промпт не влезет
+    notes = await summary.block(
+        chat_id, summary.present(rows, asked_by, branch, self_names or ()))
     if notes:
         system += "\n\n" + notes
     # лорбук будим по тексту самой переписки, а не по всему промпту
@@ -1100,11 +1289,17 @@ async def ask(s, chat_title: str | None, chat_id: int, asked_by: str,
         task.append(reply_note)
     if images:
         task.append("К сообщению приложена картинка — посмотри на неё.")
-    # На реплику показываем, а не повторяем её: она уже стоит последней
-    # строкой переписки, и повтор давал модели один и тот же текст дважды.
-    # Порог по длине тут был — не помог: короткую реплику топила не нехватка
-    # цитаты, а нота о реплае, и лечится это в самой ноте.
-    task.append(f"Отвечай на последнюю реплику — её написал {asked_by}." + "\n"
+    # Реплику называем дословно, хотя она уже стоит последней строкой
+    # переписки. Повтор тут не лишний: в промпте полсотни строк чата, и одна
+    # короткая реплика среди них тонет — бот отвечал не собеседнику, а тому,
+    # о чём в чате шумели последние полчаса. На замере пересказ фона упал с
+    # 4 случаев из 4 до 1, обращение к собеседнику выросло с 1 до 3.
+    #
+    # Раньше от этого повтора ответы рассыпались на обрывки — но тогда текст
+    # доезжал до модели трижды: строкой чата, нотой о реплае и заданием. Ноту
+    # на соседнюю реплику больше не выписываем, повторов осталось два, и на
+    # длинных сообщениях обрывов нет: 0 из 6.
+    task.append(f"Отвечай на эту реплику — {asked_by}: «{question[:400]}»." + "\n"
                 f"{_length_rule(s)[0].capitalize()}.")
     # задание — продолжение той же реплики, а не отдельный ход: два user
     # подряд Anthropic не принимает, да и модели понятнее одним куском
@@ -1171,6 +1366,10 @@ async def ask(s, chat_title: str | None, chat_id: int, asked_by: str,
                 return []
     except Exception:
         logger.warning("ai: запрос не прошёл в чате %s", chat_id, exc_info=True)
+        return []
+    if taboo(text):
+        logger.warning("ai: чат %s, модель написала на запретную тему — не отправляю",
+                       chat_id)
         return []
     if len(text) > max(config.AI_MAX_CHARS, _length_rule(s)[1]):
         # столько в чате не пишут: это модель рассуждает вслух. Молчим.
@@ -1489,20 +1688,36 @@ async def maybe_reply(bot, message, s) -> None:
     snapshot = await history(chat_id, s.ai_ctx, thread if s.ai_topics else None)
     note = await _reply_note(bot, message, who, snapshot)
     branch = chain(await history(chat_id, config.AI_HISTORY), reply_to)
+    # Отвечают на реплику самого бота — ветку не показываем, хватит ноты.
+    # Иначе его же слова доезжали до модели четырежды: строкой чата, подписью
+    # «в ответ тебе», веткой и нотой, — и она принимала их за слова
+    # собеседника. На «Коул, расскажи шутку» в ответ на его «Это – слабость…»
+    # бот начинал «Слабость? Ты называешь это слабостью?» в 5 случаях из 8;
+    # без ветки — 0 из 8.
+    if branch and branch[-1].who == SELF:
+        branch = None
     images = []
     if s.ai_vision:
         try:
             images = await vision.grab(bot, message)
         except Exception:
             logger.warning("не собрать картинки в чате %s", chat_id, exc_info=True)
+    # Голое фото, которое так и не скачалось. Без пометки модель видит только
+    # «[фото]» и гадает вслепую, а молчание на прямое обращение выглядит
+    # поломкой. Пусть признается, что не видит, — в своём характере.
+    blind = (not images and not (message.text or message.caption)
+             and vision.has_photo(message))
+    if blind:
+        logger.info("ai: чат %s, фото не скачалось — отвечаю вслепую", chat_id)
+        note = f"{note}\n{_BLIND}" if note else _BLIND
     asyncio.create_task(_respond(bot, message, s, who, text, snapshot, note,
-                                 branch, images, thread))
+                                 branch, images, thread, blind))
 
 
 async def _respond(bot, message, s, who: str, text: str,
                    snapshot: list | None = None, note: str | None = None,
                    branch: list | None = None, images: list[str] | None = None,
-                   thread: int | None = None) -> None:
+                   thread: int | None = None, blind: bool = False) -> None:
     chat_id = message.chat.id
     # в форум-группах сообщение без темы падает в «General»: bot.send_message
     # сам её не подставит, в отличие от message.answer
@@ -1518,6 +1733,8 @@ async def _respond(bot, message, s, who: str, text: str,
     parts = await ask(s, message.chat.title, chat_id, who, text, self_names,
                       snapshot=snapshot, reply_note=note, branch=branch,
                       images=images)
+    if not parts and blind and config.AI_BLIND_REPLY:
+        parts = [config.AI_BLIND_REPLY]     # модель промолчала, а звали же
     if not parts:
         return
     await _count(chat_id)

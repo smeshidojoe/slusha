@@ -124,23 +124,73 @@ async def main():
     await db.set_setting(CID, "ai_random", 50)
     await db.set_setting(CID, "ai_names", "")
     s = await db.get_settings(CID)
-    real = ai.random.randrange
-    ai.random.randrange = lambda n: n // 4          # ровно четверть диапазона
-    try:
-        check("на осмысленной реплике шанс срабатывает",
-              await ai.should_reply(bot, msg("кто пойдёт за пивом сегодня"), s))
-        check("на шуме тот же бросок уже не проходит",
-              not await ai.should_reply(bot, msg("ок"), s))
-    finally:
-        ai.random.randrange = real
+    # судья — это модель; подменяем ответ и считаем, сколько раз спросили
+    verdict = {"say": "2", "asked": 0, "system": "", "question": ""}
+
+    async def fake_raw(system, question, tokens, images=None):
+        verdict["asked"] += 1
+        verdict["system"], verdict["question"] = system, question
+        return verdict["say"]
+
+    real_raw = ai.raw
+    ai.raw = fake_raw
+    ai._last_reply.clear()
+    await ai.remember(CID, "@petya", "вечер свободный", 0)
+    await ai.remember(CID, "@vasya", "кто пойдёт за пивом сегодня", 1)
+    check("вопрос всему чату — влезаем",
+          await ai.should_reply(bot, msg("кто пойдёт за пивом сегодня"), s))
+    check("судья видит переписку", "кто пойдёт за пивом" in verdict["question"])
+    check("и спрашивают его, кому адресовано",
+          "одной цифрой" in verdict["system"] and "Слюша" in verdict["system"])
+    check("характер тут ни при чём", "ДА или НЕТ" not in verdict["system"])
+    verdict["say"] = "1."
+    check("обращение к боту — влезаем",
+          await ai.should_reply(bot, msg("кто пойдёт за пивом сегодня"), s))
+    verdict["say"] = "3"
+    check("разговор людей между собой — молчим",
+          not await ai.should_reply(bot, msg("кто пойдёт за пивом сегодня"), s))
+    verdict["say"] = "2"
+    asked = verdict["asked"]
+    check("на шуме судью даже не будим",
+          not await ai.should_reply(bot, msg("ок"), s) and verdict["asked"] == asked)
+
+    # болтливость: после своей реплики ждём gap чужих сообщений
+    check("болтливость 50 — раз в 2", ai.gap(50) == 2)
+    check("болтливость 3 — раз в 34", ai.gap(3) == 34)
+    check("подпись в меню", config.AI_RANDOM_LABELS[5] == "не чаще раза в 20 сообщений")
+    await ai.remember(CID, ai.SELF, "я тут", 2)
+    await ai.remember(CID, "@vasya", "кто пойдёт за пивом сегодня", 3)
+    asked = verdict["asked"]
+    check("только что говорил — молчим без судьи",
+          not await ai.should_reply(bot, msg("кто пойдёт за пивом сегодня"), s)
+          and verdict["asked"] == asked)
+    await ai.remember(CID, "@petya", "я пойду", 4)
+    check("прошло два чужих — снова думает",
+          await ai.should_reply(bot, msg("я пойду"), s))
+    ai._last_reply[CID] = __import__("time").time()
+    check("в кулдаун судью не спрашиваем",
+          not await ai.should_reply(bot, msg("я пойду"), s))
+    ai._last_reply.clear()
+    ai._judging.add(CID)
+    check("пока судья думает, второго не зовём",
+          not await ai.should_reply(bot, msg("я пойду"), s))
+    ai._judging.discard(CID)
+    verdict["say"] = ""
+    check("судья промолчал — молчим и мы",
+          not await ai.should_reply(bot, msg("я пойду"), s))
+    verdict["say"] = "ДА"
+
     await db.set_setting(CID, "ai_random", 100)
     s = await db.get_settings(CID)
-    check("прямое обращение отвечается и на шуме",
+    verdict["say"] = "нет"
+    check("прямое обращение отвечается и на шуме, судья не нужен",
           await ai.should_reply(bot, msg("@slusha_bot ок"), s))
+    verdict["say"] = "ДА"
 
-    # --- шанс ответить на ответ себе ---
+    # --- ответ на ответ себе ---
     # Раньше реплай боту отвечался всегда, и разговор вырождался в пинг-понг:
-    # человек отвечает боту, бот обязательно человеку, тот снова боту.
+    # человек отвечает боту, бот обязательно человеку, тот снова боту. Потом
+    # был кубик. Теперь решает судья — по смыслу ответа.
     def from_bot(text="моя реплика"):
         return SimpleNamespace(from_user=SimpleNamespace(id=1000,
                                                          username="slusha_bot",
@@ -154,51 +204,40 @@ async def main():
 
     await db.set_setting(CID, "ai_random", 0)
     await db.set_setting(CID, "ai_names", "слюша")
-    await db.set_setting(CID, "ai_reply", 35)
+    await db.set_setting(CID, "ai_reply", 50)
     s = await db.get_settings(CID)
-    check("значение по умолчанию — 35", s.ai_reply == 35)
 
     to_bot = msg("а почему так", mid=20, reply=from_bot())
     check("реплай боту распознан", await ai.replied_to(bot, to_bot))
     check("реплай другому — не нам",
           not await ai.replied_to(bot, msg("ага", mid=21, reply=from_human())))
 
-    real = ai.random.randrange
-    ai.random.randrange = lambda n: 10          # бросок ниже 35
-    try:
-        check("удачный бросок — отвечаем", await ai.should_reply(bot, to_bot, s))
-    finally:
-        ai.random.randrange = real
-    ai.random.randrange = lambda n: 40          # бросок выше 35
-    try:
-        check("неудачный бросок — молчим", not await ai.should_reply(bot, to_bot, s))
-        check("и на случайный шанс это не проваливается",
-              not await ai.should_reply(bot, to_bot, s))
-        by_name = msg("слюша, а почему так", mid=22, reply=from_bot())
-        check("имя в том же сообщении отвечается всегда",
-              await ai.should_reply(bot, by_name, s))
-    finally:
-        ai.random.randrange = real
+    check("судья за — отвечаем", await ai.should_reply(bot, to_bot, s))
+    check("у реплая свои правила судьи", "ответил на твоё сообщение" in verdict["system"])
+    verdict["say"] = "НЕТ"
+    check("судья против — молчим", not await ai.should_reply(bot, to_bot, s))
+    by_name = msg("слюша, а почему так", mid=22, reply=from_bot())
+    check("имя в том же сообщении отвечается всегда",
+          await ai.should_reply(bot, by_name, s))
+    verdict["say"] = "ДА"
 
     await db.set_setting(CID, "ai_reply", 0)
     s = await db.get_settings(CID)
     check("ноль — на реплаи не отвечаем вовсе",
-          not any([await ai.should_reply(bot, to_bot, s) for _ in range(50)]))
+          not await ai.should_reply(bot, to_bot, s))
     check("но по имени зовётся по-прежнему",
           await ai.should_reply(bot, msg("слюша ау", mid=23), s))
 
     await db.set_setting(CID, "ai_reply", 100)
     s = await db.get_settings(CID)
-    check("сотня — отвечаем на каждый ответ себе",
-          all([await ai.should_reply(bot, to_bot, s) for _ in range(50)]))
+    verdict["say"] = "нет"
+    check("сотня — отвечаем на каждый ответ себе, без судьи",
+          await ai.should_reply(bot, to_bot, s))
+    verdict["say"] = "ДА"
 
-    # частота держится около выставленной
-    await db.set_setting(CID, "ai_reply", 35)
-    s = await db.get_settings(CID)
-    hits = sum([await ai.should_reply(bot, to_bot, s) for _ in range(2000)])
-    check(f"частота около 35% (вышло {hits * 100 // 2000}%)",
-          500 < hits < 900)
-
+    ai.raw = real_raw
+    ai._last_reply.clear()
+    await db.set_setting(CID, "ai_reply", 50)
     await db.set_setting(CID, "ai_names", "")
     await db.set_setting(CID, "ai_random", 100)
 
@@ -343,7 +382,7 @@ async def main():
           sent["m"][1] == {"role": "assistant", "content": "дороже, чем вчера."})
     check("задание идёт последним ходом",
           sent["m"][-1]["role"] == "user"
-          and "Отвечай на последнюю реплику" in sent["m"][-1]["content"])
+          and "Отвечай на эту реплику" in sent["m"][-1]["content"])
     check("простыни <chat> больше нет", "<chat>" not in ai.flatten(sent["m"]))
 
     await db.set_setting(CID, "ai_examples", None)
@@ -420,6 +459,42 @@ async def main():
           == "ну что, опять ты?")
     check("эхо длинной фразы режем",
           ai.strip_echo("коул ты тут? Да, я тут.", "коул ты тут?") == "Да, я тут.")
+    # --- запретная тема: сексуализация детей ---
+    # В живом чате бота подначивали, и на «Любишь ЦП?» он ответил «Не люблю.
+    # Но в теории — неплохо». Фильтр в коде: на вход, в контекст и на выход.
+    check("запретное узнаётся", ai.taboo("Любишь ЦП?") and ai.taboo("детское порно"))
+    check("процессор — не запретное", not ai.taboo("какой у тебя цп, intel или amd?"))
+    check("Набоков — не запретное", not ai.taboo("лолита набокова"))
+    called = []
+
+    async def must_not_run(system, messages, tokens=0, images=None):
+        called.append(1)
+        return "ответ"
+
+    ai._ask_ollama = must_not_run
+    out = await ai.ask(s, "Чат", CID, "@vasya", "Любишь ЦП?", snapshot=[])
+    check("на запретное бот молчит", out == [])
+    check("и модель даже не спрашивали", called == [])
+
+    seen = {}
+
+    async def peek(system, messages, tokens=0, images=None):
+        seen["m"] = ai.flatten(messages)
+        return "нормальный ответ"
+
+    ai._ask_ollama = peek
+    await ai.ask(s, "Чат", CID, "@vasya", "а ты как думаешь?",
+                 snapshot=[Line("@petya", "Любишь ЦП?", 1), Line("@petya", "шучу", 2)])
+    check("запретная строка не попадает в контекст", "ЦП" not in seen["m"])
+    check("а соседние попадают", "шучу" in seen["m"])
+
+    async def dirty(system, messages, tokens=0, images=None):
+        return "Просто «цп»."
+
+    ai._ask_ollama = dirty
+    out = await ai.ask(s, "Чат", CID, "@vasya", "что там?", snapshot=[])
+    check("если модель сама это написала — не отправляем", out == [])
+
     # --- вставки в звёздочках ---
     # В чат ушло «Вареная колбаса... *Мяукает*. Слишком много...» — архимагос
     # Механикус мяукать не должен, а модель ставит такое сама, без подсказки
@@ -689,10 +764,12 @@ async def main():
     check("двух user подряд нет",
           all(a["role"] != b["role"] for a, b in zip(msgs, msgs[1:])))
     check("задание приклеено к последней реплике",
-          "Отвечай на последнюю реплику" in msgs[-1]["content"]
+          "Отвечай на эту реплику" in msgs[-1]["content"]
           and "@vasya: как дела" in msgs[-1]["content"])
-    check("вопрос в промпте ровно один раз",
-          ai.flatten(msgs).count("как дела") == 1)
+    # Реплика в промпте дважды — строкой чата и в задании. Это нарочно:
+    # одна короткая строка среди полусотни тонет, и бот отвечал фону чата.
+    check("реплика названа и в переписке, и в задании",
+          ai.flatten(msgs).count("как дела") == 2)
 
     # А длинную не повторяем: она уже стоит последней строкой переписки,
     # и дословный повтор давал модели один и тот же текст трижды.
@@ -702,10 +779,11 @@ async def main():
     await ai.ask(s, "Чат", CID, "@vasya", long_q,
                  snapshot=[Line("@vasya", long_q)])
     tail = calls[0][-1]["content"]
-    check("длинную реплику дословно не повторяем",
-          "Отвечай на последнюю реплику" in tail)
-    check("и в промпте она ровно одна",
-          ai.flatten(calls[0]).count(long_q) == 1)
+    check("длинную реплику называем так же",
+          "Отвечай на эту реплику" in tail)
+    # На длинных сообщениях повтор проверяли отдельно: обрывов 0 из 6.
+    check("и она тоже названа дважды",
+          ai.flatten(calls[0]).count(long_q) == 2)
 
     # --- запас токенов думающей модели даётся всегда ---
     was_model, was_hush = config.AI_MODEL, config.AI_NO_THINK
@@ -804,6 +882,47 @@ async def main():
     check("оборванная ссылка не роняет", ai.chain(rows, 999) == [])
     loop_rows = [Line("@vasya", "сам себе", 9, 9)]
     check("цикл не зациклил", len(ai.chain(loop_rows, 9)) == 1)
+
+    # Реплай на реплику самого бота — без ветки. Его слова иначе доезжали до
+    # модели четырежды, и на «Коул, расскажи шутку» в ответ на его «Это –
+    # слабость…» бот начинал «Слабость? Ты называешь это слабостью?».
+    got = {}
+
+    async def fake_respond(bot_, message, s_, who, text, snapshot=None, note=None,
+                           branch=None, images=None, thread=None, blind=False):
+        got.update(note=note, branch=branch)
+
+    real_respond = ai._respond
+    ai._respond = fake_respond
+    try:
+        await db.set_setting(CID, "ai_reply", 100)
+        s = await db.get_settings(CID)
+        await ai.remember(CID, "@vasya", "что такое бахрот", 301)
+        await ai.remember(CID, ai.SELF, "Это – слабость, которую надо устранить", 302, 301)
+        await ai.remember(CID, "@petya", "он просто хочет сожрать мишу", 303, 301)
+        own = SimpleNamespace(from_user=SimpleNamespace(id=1000, username="slusha_bot",
+                                                        full_name="Слюша"),
+                              text="Это – слабость, которую надо устранить",
+                              caption=None, message_id=302)
+        ai._last_reply.clear()
+        await ai.maybe_reply(bot, msg("расскажи шутку", mid=304, reply=own), s)
+        await asyncio.sleep(0)
+        check("реплай боту: нота есть", bool(got.get("note")))
+        check("реплай боту: ветки нет", not got.get("branch"))
+
+        got.clear()
+        human = SimpleNamespace(from_user=SimpleNamespace(id=8, username="petya",
+                                                          full_name="Петя"),
+                                text="он просто хочет сожрать мишу",
+                                caption=None, message_id=303)
+        ai._last_reply.clear()
+        await ai.maybe_reply(bot, msg("@slusha_bot правда?", mid=305, reply=human), s)
+        await asyncio.sleep(0)
+        check("реплай человеку: ветка осталась", len(got.get("branch") or []) == 2)
+    finally:
+        ai._respond = real_respond
+        ai._last_reply.clear()
+        await db.set_setting(CID, "ai_reply", 50)
 
     # --- B4: реакции ---
     def r(kind, emoji=None):

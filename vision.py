@@ -10,12 +10,15 @@
 шлём — это само сообщение и то, на которое отвечают; всё остальное к поводу
 ответить отношения не имеет.
 """
+import asyncio
 import base64
 import logging
 
 from . import config
 
 logger = logging.getLogger("slusha.vision")
+
+_TRIES = 3
 
 
 def _biggest(message) -> object | None:
@@ -40,12 +43,19 @@ async def _one(bot, size) -> str | None:
         logger.info("картинка %s байт больше лимита %s, пропускаю",
                     size.file_size, limit)
         return None
-    try:
-        buf = await bot.download(size.file_id)
-        raw = buf.read()
-    except Exception:
-        logger.warning("не скачать картинку", exc_info=True)
-        return None
+    # Соединение с Telegram рвётся на ровном месте, особенно сразу после
+    # запуска, пока сеть не поднялась: ConnectionResetError посреди TLS. Со
+    # второй-третьей попытки обычно проходит.
+    raw = None
+    for attempt in range(_TRIES):
+        try:
+            raw = (await bot.download(size.file_id)).read()
+            break
+        except Exception as e:
+            if attempt + 1 == _TRIES:
+                logger.warning("не скачать картинку: %s", e)
+                return None
+            await asyncio.sleep(attempt + 1)
     if len(raw) > limit:
         # file_size у Telegram необязательное поле: бывает, что его нет вовсе,
         # и настоящий размер выясняется только после скачивания

@@ -35,7 +35,7 @@ CREATE TABLE IF NOT EXISTS settings(
     ai_names    TEXT,
     ai_free     INTEGER NOT NULL DEFAULT 0,
     ai_len      INTEGER NOT NULL DEFAULT 1,
-    ai_reply    INTEGER NOT NULL DEFAULT 35,
+    ai_reply    INTEGER NOT NULL DEFAULT 50,
     ai_lang     INTEGER NOT NULL DEFAULT 1,
     ai_vision   INTEGER NOT NULL DEFAULT 0,
     ai_topics   INTEGER NOT NULL DEFAULT 0,
@@ -85,7 +85,7 @@ class Settings:
     ai_names: str | None = None
     ai_free: int = 0
     ai_len: int = 1
-    ai_reply: int = 35
+    ai_reply: int = 50
     ai_lang: int = 1
     ai_vision: int = 0
     ai_topics: int = 0
@@ -138,7 +138,7 @@ async def _migrate() -> None:
     """Разовые правки старых баз. Флаг в kv, чтобы не повторялись при каждом старте."""
     # Новые настройки чата. Проверка по PRAGMA, а не по флагу: так миграция
     # безразлична к тому, с какой версии база приехала и что уже накатывали.
-    for name, decl in (("ai_reply", "INTEGER NOT NULL DEFAULT 35"),
+    for name, decl in (("ai_reply", "INTEGER NOT NULL DEFAULT 50"),
                        ("ai_lang", "INTEGER NOT NULL DEFAULT 1"),
                        ("ai_vision", "INTEGER NOT NULL DEFAULT 0"),
                        ("ai_topics", "INTEGER NOT NULL DEFAULT 0"),
