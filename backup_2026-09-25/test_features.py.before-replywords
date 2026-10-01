@@ -237,11 +237,6 @@ async def main():
     check("у реплая свои правила судьи", "ответил на твоё сообщение" in verdict["system"])
     verdict["say"] = "НЕТ"
     check("судья против — молчим", not await ai.should_reply(bot, to_bot, s))
-    asked = verdict["asked"]
-    long = msg("ты насмотрелся уральских пельменей забыл про тёщу упомянуть",
-               mid=24, reply=from_bot())
-    check("развёрнутый ответ себе — отвечаем без судьи",
-          await ai.should_reply(bot, long, s) and verdict["asked"] == asked)
     by_name = msg("слюша, а почему так", mid=22, reply=from_bot())
     check("имя в том же сообщении отвечается всегда",
           await ai.should_reply(bot, by_name, s))
