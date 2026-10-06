@@ -17,6 +17,7 @@
 import asyncio
 import logging
 import os
+import re
 import time
 from typing import NamedTuple
 
@@ -86,9 +87,55 @@ CREATE TABLE IF NOT EXISTS ai_people(
     updated_at INTEGER NOT NULL,
     PRIMARY KEY (chat_id, key)
 );
+-- Как человек обращается с ботом: сколько грубостей и добрых слов ему
+-- досталось. Счёт затухает со временем (см. mood.py). Отдельно от ai_people:
+-- те записи переписывает пересборка заметок, а счёт копится с каждой реплики.
+CREATE TABLE IF NOT EXISTS ai_mood(
+    chat_id    INTEGER NOT NULL,
+    key        TEXT    NOT NULL,
+    who        TEXT    NOT NULL,
+    rude       REAL    NOT NULL DEFAULT 0,
+    kind       REAL    NOT NULL DEFAULT 0,
+    updated_at INTEGER NOT NULL,
+    PRIMARY KEY (chat_id, key)
+);
+-- Незакрытые темы: план человека со сроком — чтобы потом спросить, как
+-- прошло (см. plans.py). ask_from/ask_to — окно, когда вопрос уместен.
+CREATE TABLE IF NOT EXISTS ai_plans(
+    id       INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_id  INTEGER NOT NULL,
+    key      TEXT    NOT NULL,
+    who      TEXT    NOT NULL,
+    text     TEXT    NOT NULL,
+    ts       INTEGER NOT NULL,
+    ask_from INTEGER NOT NULL,
+    ask_to   INTEGER NOT NULL,
+    done     INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_ai_plans ON ai_plans(chat_id, key, done);
 CREATE TABLE IF NOT EXISTS meta(
     k TEXT PRIMARY KEY,
     v TEXT
+);
+-- Долгая память (memory.py): события из жизни участников с датой и важностью.
+-- kind: event — случившееся, insight — вывод о человеке из нескольких событий.
+CREATE TABLE IF NOT EXISTS ai_events(
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_id    INTEGER NOT NULL,
+    key        TEXT    NOT NULL,
+    who        TEXT    NOT NULL,
+    text       TEXT    NOT NULL,
+    importance INTEGER NOT NULL DEFAULT 5,
+    ts         INTEGER NOT NULL,
+    kind       TEXT    NOT NULL DEFAULT 'event',
+    hits       INTEGER NOT NULL DEFAULT 0,
+    used_at    INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_ai_events ON ai_events(chat_id, ts);
+-- Эмбеддинги фраз: считаются один раз, ключ — хэш модели и текста.
+CREATE TABLE IF NOT EXISTS ai_vectors(
+    hash TEXT PRIMARY KEY,
+    vec  BLOB NOT NULL
 );
 """
 
@@ -217,6 +264,9 @@ async def clear(chat_id: int) -> int:
     cur = await db.execute("DELETE FROM ai_history WHERE chat_id = ?", (chat_id,))
     await db.execute("DELETE FROM ai_summary WHERE chat_id = ?", (chat_id,))
     await db.execute("DELETE FROM ai_people WHERE chat_id = ?", (chat_id,))
+    await db.execute("DELETE FROM ai_mood WHERE chat_id = ?", (chat_id,))
+    await db.execute("DELETE FROM ai_plans WHERE chat_id = ?", (chat_id,))
+    await db.execute("DELETE FROM ai_events WHERE chat_id = ?", (chat_id,))
     await db.commit()
     _since_prune.pop(chat_id, None)
     return cur.rowcount or 0
@@ -283,8 +333,12 @@ async def summary_clear(chat_id: int) -> bool:
     db = await _conn()
     cur = await db.execute("DELETE FROM ai_summary WHERE chat_id = ?", (chat_id,))
     gone = await db.execute("DELETE FROM ai_people WHERE chat_id = ?", (chat_id,))
+    moods = await db.execute("DELETE FROM ai_mood WHERE chat_id = ?", (chat_id,))
+    plans = await db.execute("DELETE FROM ai_plans WHERE chat_id = ?", (chat_id,))
+    events = await db.execute("DELETE FROM ai_events WHERE chat_id = ?", (chat_id,))
     await db.commit()
-    return bool(cur.rowcount or gone.rowcount)
+    return bool(cur.rowcount or gone.rowcount or moods.rowcount or plans.rowcount
+                or events.rowcount)
 
 
 # ---------- память о людях ----------
@@ -353,6 +407,142 @@ async def people_set(chat_id: int, people) -> None:
                 ORDER BY updated_at DESC LIMIT ?)""",
         (chat_id, chat_id, PEOPLE_KEEP),
     )
+    await db.commit()
+
+
+def _keys_of(who: str) -> set[str]:
+    """Ключи, под которыми человек может лежать: с собакой и без.
+
+    В меню ник набирают как придётся — «vasya», «@Vasya», — а в базе он такой,
+    каким подписан в переписке.
+    """
+    k = person_key(who)
+    if not k:
+        return set()
+    bare = k.lstrip("@")
+    return {k, bare, "@" + bare} if bare else {k}
+
+
+async def people_forget(chat_id: int, whos) -> list[str]:
+    """Забыть названных людей целиком. Вернуть, кого нашли.
+
+    Стираем запись о человеке, счёт его обращения с ботом и строки общих
+    заметок, где он назван: иначе из «шуток и прозвищ» он вернулся бы в
+    первую же пересборку.
+    """
+    db = await _conn()
+    found = []
+    text, covered = await summary_get(chat_id)
+    lines = text.splitlines()
+    for who in whos:
+        keys = _keys_of(who)
+        if not keys:
+            continue
+        marks = ",".join("?" * len(keys))
+        hit = False
+        for table in ("ai_people", "ai_mood", "ai_plans", "ai_events"):
+            cur = await db.execute(
+                f"DELETE FROM {table} WHERE chat_id = ? AND key IN ({marks})",
+                (chat_id, *keys))
+            hit = hit or bool(cur.rowcount)
+        bare = person_key(who).lstrip("@")
+        # Ник ищем целым словом: «@kat» не должен сносить строки про @katieboots.
+        named = re.compile(rf"(?<![\w@])@?{re.escape(bare)}(?!\w)", re.IGNORECASE)
+        # события других людей, где он назван, — тоже о нём
+        cur = await db.execute("SELECT id, text FROM ai_events WHERE chat_id = ?", (chat_id,))
+        about = [r["id"] for r in await cur.fetchall() if named.search(r["text"])]
+        if about:
+            await db.execute(f"DELETE FROM ai_events WHERE id IN ({','.join('?' * len(about))})",
+                             about)
+            hit = True
+        kept = [ln for ln in lines
+                if not (ln.lstrip().startswith("—") and named.search(ln))]
+        if len(kept) != len(lines):
+            hit, lines = True, kept
+        if hit:
+            found.append(who.strip())
+    if "\n".join(lines) != text:
+        await summary_set(chat_id, "\n".join(lines), covered)
+    await db.commit()
+    return found
+
+
+# ---------- как люди обращаются с ботом ----------
+
+async def mood_get(chat_id: int, who: str) -> tuple[float, float, int] | None:
+    """Счёт человека: (грубость, доброта, когда обновлён). None — ни разу не считали."""
+    db = await _conn()
+    cur = await db.execute(
+        "SELECT rude, kind, updated_at FROM ai_mood WHERE chat_id = ? AND key = ?",
+        (chat_id, person_key(who)))
+    row = await cur.fetchone()
+    return (row["rude"], row["kind"], row["updated_at"]) if row else None
+
+
+async def mood_set(chat_id: int, who: str, rude: float, kind: float) -> None:
+    db = await _conn()
+    await db.execute(
+        """INSERT INTO ai_mood (chat_id, key, who, rude, kind, updated_at)
+           VALUES (?,?,?,?,?,?)
+           ON CONFLICT(chat_id, key) DO UPDATE SET
+               who = excluded.who, rude = excluded.rude, kind = excluded.kind,
+               updated_at = excluded.updated_at""",
+        (chat_id, person_key(who), who, rude, kind, int(time.time())))
+    await db.commit()
+
+
+async def mood_all(chat_id: int) -> dict[str, tuple[float, float, int, str]]:
+    """Все счета чата: ключ -> (грубость, доброта, когда обновлён, ник)."""
+    db = await _conn()
+    cur = await db.execute(
+        "SELECT key, who, rude, kind, updated_at FROM ai_mood WHERE chat_id = ?"
+        " ORDER BY updated_at DESC", (chat_id,))
+    return {r["key"]: (r["rude"], r["kind"], r["updated_at"], r["who"])
+            for r in await cur.fetchall()}
+
+
+# ---------- незакрытые темы ----------
+
+async def plan_add(chat_id: int, who: str, text: str, ts: int,
+                   ask_from: int, ask_to: int, keep: int) -> None:
+    """Запомнить план. У человека держим keep самых свежих, отжившие — стираем."""
+    db = await _conn()
+    key = person_key(who)
+    await db.execute("DELETE FROM ai_plans WHERE ask_to < ?", (ts,))
+    await db.execute(
+        """INSERT INTO ai_plans (chat_id, key, who, text, ts, ask_from, ask_to)
+           VALUES (?,?,?,?,?,?,?)""",
+        (chat_id, key, who, text, ts, ask_from, ask_to))
+    await db.execute(
+        """DELETE FROM ai_plans WHERE chat_id = ? AND key = ? AND id NOT IN
+               (SELECT id FROM ai_plans WHERE chat_id = ? AND key = ?
+                ORDER BY id DESC LIMIT ?)""",
+        (chat_id, key, chat_id, key, keep))
+    await db.commit()
+
+
+async def plans_due(chat_id: int, who: str, now: int) -> list[tuple[int, str, int]]:
+    """Созревшие и не спрошенные планы человека: [(id, текст, когда сказано)]."""
+    db = await _conn()
+    cur = await db.execute(
+        """SELECT id, text, ts FROM ai_plans WHERE chat_id = ? AND key = ? AND done = 0
+           AND ask_from <= ? AND ask_to >= ? ORDER BY ts""",
+        (chat_id, person_key(who), now, now))
+    return [(r["id"], r["text"], r["ts"]) for r in await cur.fetchall()]
+
+
+async def plans_open(chat_id: int) -> list[tuple[str, str, int]]:
+    """Все ещё не спрошенные планы чата: [(ник, текст, с какого момента спросить)]."""
+    db = await _conn()
+    cur = await db.execute(
+        """SELECT who, text, ask_from FROM ai_plans WHERE chat_id = ? AND done = 0
+           AND ask_to >= ? ORDER BY ask_from""", (chat_id, int(time.time())))
+    return [(r["who"], r["text"], r["ask_from"]) for r in await cur.fetchall()]
+
+
+async def plan_done(plan_id: int) -> None:
+    db = await _conn()
+    await db.execute("UPDATE ai_plans SET done = 1 WHERE id = ?", (plan_id,))
     await db.commit()
 
 

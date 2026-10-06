@@ -122,13 +122,6 @@ async def main():
         check("и лежит в базе",
               (await db.get_settings(CID)).ai_persona == "Ехидный торговец.")
 
-        r = await client.post(f"/api/chat/{CID}/lore", headers=head,
-                              json={"keys": "пиво", "content": "В баре наливают."})
-        check("запись лора добавляется", r.status == 200)
-        rid = (await r.json())["id"]
-        r = await client.delete(f"/api/chat/{CID}/lore/{rid}", headers=head)
-        check("и удаляется", r.status == 200 and await db.lore_count(CID) == 0)
-
         # --- чужой чат ---
         alien = {"X-Init-Data": init_data(STRANGER)}
         r = await client.get(f"/api/chat/{CID}", headers=alien)

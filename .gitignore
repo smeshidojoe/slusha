@@ -10,3 +10,7 @@ data/
 __pycache__/
 *.py[cod]
 .venv/
+
+# память бота: хранилище Obsidian и картинки из поиска — живые данные чатов
+vault/
+search/

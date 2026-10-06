@@ -74,7 +74,7 @@ class FakeHttp:
     def __init__(self):
         self.calls = []
 
-    async def post(self, path, json=None):
+    async def post(self, path, json=None, **kw):
         self.calls.append((path, json))
         if path == "/api/chat":
             return FakeResp({"message": {"content": "ага"}})
@@ -417,8 +417,8 @@ async def main():
           ai._EXAMPLE_NOTE not in ai._prompt(s, "Чат", "@v"))
 
     # примеры из настоящей карточки chub: раньше это поле выбрасывалось
-    from slusha import lore as lorem
-    card = lorem.parse_card({"data": {
+    from slusha import card as cards
+    card = cards.parse_card({"data": {
         "name": "Holo", "description": "Мудрая волчица.",
         "mes_example": "<START>\n{{user}}: почём яблоки?\n"
                        "{{char}}: дороже вчерашнего.\n"
@@ -426,46 +426,11 @@ async def main():
     check("mes_example разобран", card["examples"].count("\n") == 3)
     check("герой подписан как «ты»", card["examples"].startswith("собеседник: почём"))
     check("плейсхолдеры не просочились", "{{" not in card["examples"])
-    done = await lorem.apply_card(CID, card)
+    done = await cards.apply_card(CID, card)
     check("импорт кладёт примеры в настройки", "примеры реплик" in done)
     check("и они видны боту",
           len(ai.examples(await db.get_settings(CID))) == 4)
     await db.set_setting(CID, "ai_examples", None)
-
-    # --- фоновый лор выключается ---
-    from slusha import lore
-    await db.lore_add(CID, "wheat, harvest", "Пшеница родит раз в год. " * 30)
-    hit = await lore.block(CID, "расскажи про wheat")
-    check("по совпавшему ключу лор просыпается", bool(hit))
-    bg = await lore.block(CID, "привет как дела", background=True)
-    check("без совпадений фон подмешивается", bool(bg))
-    off = await lore.block(CID, "привет как дела", background=False)
-    check("и выключается тумблером", off == "")
-    always = await lore.block(CID, "привет как дела", background=False)
-    check("выключатель не трогает совпавшее по ключу",
-          bool(await lore.block(CID, "про wheat речь", background=False)) and always == "")
-    await db.lore_clear(CID)
-
-    # --- совпавшее по ключу идёт вперёд фона ---
-    # Записи «всегда» раньше сваливались в одну кучу с совпавшими и по prio
-    # съедали бюджет целиком: то, что реально относилось к разговору, до
-    # модели не доезжало.
-    await db.lore_clear(CID)
-    for i in range(6):
-        await db.lore_add(CID, "", "Постоянная справка о мире номер %d. " % i * 25,
-                          always=1, prio=1)
-    await db.lore_add(CID, "пиво", "В баре наливают тёмное, по три монеты." * 8,
-                      always=0, prio=99)
-    block = await lore.block(CID, "кто пойдёт за пивом", background=False)
-    check("совпавшее по ключу попало в промпт", "тёмное" in block)
-    check("и стоит первым, до фона",
-          block.index("тёмное") < block.index("Постоянная"))
-    check("фон занимает остаток бюджета", "Постоянная" in block)
-    only_bg = await lore.block(CID, "погода дрянь", background=False)
-    check("без совпадений остаётся один фон",
-          "Постоянная" in only_bg and "тёмное" not in only_bg)
-    check("бюджет соблюдён", len(block) <= config.LORE_BUDGET + 200)
-    await db.lore_clear(CID)
 
     # --- рамки промпта стали короче и без запретов ---
     frames = ai._FRAME_STYLE + ai._FRAME_STRICT
@@ -532,27 +497,12 @@ async def main():
           ai.strip_actions("*Вздыхает* Ну и вопросы.") == "Ну и вопросы.")
     check("текст без звёздочек не трогаем",
           ai.strip_actions("обычный ответ") == "обычный ответ")
-    await db.set_setting(CID, "ai_roleplay", 1)
-    rp = await db.get_settings(CID)
-    check("с включённым ролеплеем звёздочки остаются",
-          bool(getattr(rp, "ai_roleplay", 0)))
-    await db.set_setting(CID, "ai_roleplay", 0)
-    from slusha import schema as sch2
-    check("переключатель виден в меню",
-          any(f.key == "ai_roleplay" for f in sch2.FIELDS))
-    # --- выключатель книги мира ---
-    # Записей в книге полторы сотни; гасить их поодиночке — значит потерять
-    # то, что было включено, и не суметь вернуть. Выключатель один на чат.
-    await db.set_setting(CID, "ai_lore", 0)
-    off = await db.get_settings(CID)
-    check("выключенная книга мира не читается",
-          not getattr(off, "ai_lore", 1))
-    await db.set_setting(CID, "ai_lore", 1)
-    on = await db.get_settings(CID)
-    check("и включается обратно", bool(getattr(on, "ai_lore", 0)))
+    # Лорбук, выключатель звёздочек и темы форума убраны: ни в одном живом
+    # чате они не были включены, а боты держатся на характере и памяти.
     from slusha import schema as sch
-    check("выключатель виден в меню",
-          any(f.key == "ai_lore" for f in sch.FIELDS))
+    check("убранных переключателей нет в меню",
+          not {"ai_roleplay", "ai_lore", "ai_lore_bg", "ai_topics"}
+          & {f.key for f in sch.FIELDS})
     # --- сколько своих имён показываем модели ---
     # Ловим сообщения по всему списку, а в промпт кладём немного: длинный
     # перечень модель зачитывает вслух и берёт слова оттуда как обращение —
@@ -945,10 +895,49 @@ async def main():
         await ai.maybe_reply(bot, msg("@slusha_bot правда?", mid=305, reply=human), s)
         await asyncio.sleep(0)
         check("реплай человеку: ветка осталась", len(got.get("branch") or []) == 2)
+
+        # Реплика бота была сказана @vasya, а отвечает на неё @katie: нота
+        # называет обоих, даже если реплика бота — последняя в переписке.
+        got.clear()
+        await ai.remember(CID, ai.SELF, "Ты — очередная улитёнка", 306, 305)
+        own2 = SimpleNamespace(from_user=SimpleNamespace(id=1000, username="slusha_bot",
+                                                         full_name="Слюша"),
+                               text="Ты — очередная улитёнка", caption=None, message_id=306)
+        katie = msg("Привет, помнишь меня?", uid=9, mid=307, reply=own2)
+        katie.from_user = SimpleNamespace(id=9, username="katie", full_name="Катя",
+                                          is_bot=False)
+        ai._last_reply.clear()
+        await ai.maybe_reply(bot, katie, s)
+        await asyncio.sleep(0)
+        note = got.get("note") or ""
+        check("чужая реплика бота: нота называет, кому она была",
+              "сказанную @vasya" in note and "Пишет тебе @katie" in note)
     finally:
         ai._respond = real_respond
         ai._last_reply.clear()
         await db.set_setting(CID, "ai_reply", 50)
+
+    # --- адресат: чужой ярлык и «ты» в реплае другому ---
+    L = ai.Line
+    rows = [L("@chel", "Коул, кто твой любимый чатер?", 1),
+            L(ai.SELF, "Ты — очередная улитёнка, пытающаяся залезть в яблоню.", 2, 1),
+            L("@katie", "Привет, помнишь меня?", 3, 2)]
+    foreign = ai._foreign(rows, "@katie")
+    check("реплика бота другому узнана", foreign and foreign[1] == "@chel")
+    check("свой собеседник — не чужая", ai._foreign(rows[:2] + [L("@chel", "ну?", 3, 2)],
+                                                     "@chel") is None)
+    check("ярлык из чужой реплики пойман",
+          ai._borrowed("Да. Улитёнка. С возвращением.", foreign[0], rows[2].text) == "Улитёнка")
+    check("обычный ответ — нет",
+          ai._borrowed("Помню, конечно. Ты — ошибка в матрице.", foreign[0], rows[2].text) == "")
+    check("частые слова не в счёт",
+          ai._borrowed("Помню тех, кто пытается спорить.", foreign[0], rows[2].text) == "")
+    other = SimpleNamespace(from_user=SimpleNamespace(id=8, username="petya", full_name="Петя"))
+    check("«ты» в реплае другому — разговор двоих",
+          ai._personal(msg("а ты чем занимаешься?", reply=other), "а ты чем занимаешься?"))
+    check("реплай другому без «ты» — можно влезть",
+          not ai._personal(msg("сделай пижаму из волос", reply=other), "сделай пижаму из волос"))
+    check("без реплая — можно влезть", not ai._personal(msg("а ты что думаешь?"), "а ты что думаешь?"))
 
     # --- B4: реакции ---
     def r(kind, emoji=None):
@@ -976,14 +965,21 @@ async def main():
     rendered = ai._render(got)
     check("и рендерятся в промпте", "[реакции: 👍×2]" in rendered[0])
 
-    # --- B5: изоляция по темам ---
+    # --- тема форума запоминается: ответ уходит в ту же тему ---
     await ai.forget(CID)
     await ai.remember(CID, "@vasya", "про баню", 101, None, 77)
     await ai.remember(CID, "@petya", "про машину", 102, None, 88)
     await ai.remember(CID, "@kolya", "и про веники", 103, None, 77)
-    banya = [ln.text for ln in await ai.history(CID, 50, 77)]
-    check("в тему попали только её реплики", banya == ["про баню", "и про веники"])
-    check("без фильтра видно всё", len(await ai.history(CID, 50)) == 3)
+    rows = await ai.history(CID, 50)
+    check("переписка общая на все темы", len(rows) == 3)
+    check("тема у реплики сохранена", [ln.thread_id for ln in rows] == [77, 88, 77])
+
+    # --- снимок по целевую реплику ---
+    await ai.remember(CID, "@sasha", "дипстейт распыляет химикаты", 104, None, 77)
+    await ai.remember(CID, "@sasha", "[стикер 🔥]", 105, None, 77)
+    snap = ai.upto(await ai.history(CID, 50), 104)
+    check("снимок кончается целевой репликой", snap[-1].text == "дипстейт распыляет химикаты")
+    check("цели в снимке нет — снимок целиком", len(ai.upto(snap, 999)) == len(snap))
 
     from slusha import history as store
     await store.close()

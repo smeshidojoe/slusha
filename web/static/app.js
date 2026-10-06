@@ -1,7 +1,7 @@
 /* Панель Слюши.
  *
  * Одна страница, два экрана: список чатов и карточка чата. Ни фреймворка, ни
- * сборки — весь смысл панели в том, что характер видно целиком и лорбук
+ * сборки — весь смысл панели в том, что характер видно целиком и он
  * правится без диалога с ботом, а для этого хватает разметки и fetch.
  *
  * Состояния на клиенте не держим: после каждого действия перечитываем чат
@@ -190,41 +190,8 @@ async function screenChat(cid) {
   }
   app.append(notes);
 
-  // ---- лорбук ----
-  app.append(el(`<h2>📚 Лорбук (${d.lore.length})</h2>`));
-  const lore = el(`<div class="card"></div>`);
-  for (const r of d.lore) {
-    const item = el(`<div class="lore-item">
-        <div class="row">
-          <span class="grow keys">${r.always ? '📌 всегда' : '🔑 ' + esc(r.keys || 'без ключей')}</span>
-        </div>
-        <div class="muted">${esc(r.content.slice(0, 200))}</div>
-      </div>`);
-    const del = el(`<button class="ghost danger">✕</button>`);
-    del.onclick = async () => {
-      try { await api(`/api/chat/${cid}/lore/${r.id}`, {method: 'DELETE'}); reload(); }
-      catch (e) { fail(e); }
-    };
-    item.querySelector('.row').append(del);
-    lore.append(item);
-  }
-  const keysIn = el(`<input type="text" placeholder="ключи через запятую, * — всегда">`);
-  const textIn = el(`<textarea placeholder="текст записи"></textarea>`);
-  const add = el(`<button>Добавить запись</button>`);
-  add.onclick = async () => {
-    try {
-      await api(`/api/chat/${cid}/lore`, {method: 'POST', body: {keys: keysIn.value, content: textIn.value}});
-      reload();
-    } catch (e) { fail(e); }
-  };
-  const form = el(`<div class="lore-item"></div>`);
-  form.append(keysIn, textIn);
-  row(form, add);
-  lore.append(form);
-  app.append(lore);
-
   // ---- файл с chub.ai ----
-  const file = el(`<div class="card"><p class="muted">Файл с chub.ai: книга лора или карточка персонажа (JSON или PNG).</p></div>`);
+  const file = el(`<div class="card"><p class="muted">Файл с chub.ai: карточка персонажа (JSON или PNG).</p></div>`);
   const picker = el(`<input type="file" accept=".json,.png">`);
   picker.onchange = async () => {
     if (!picker.files.length) return;

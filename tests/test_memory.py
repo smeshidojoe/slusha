@@ -18,7 +18,10 @@ HIST = os.path.join(TMP, "t_history.sqlite3")
 os.environ.update(SLUSHA_BOT_TOKEN="1:x", SLUSHA_ADMIN_IDS="424211817",
                   SLUSHA_DB_PATH=DB, SLUSHA_LOG_PATH=os.path.join(TMP, "t.log"),
                   AI_PROVIDER="ollama", AI_BASE_URL="http://127.0.0.1:11434",
-                  AI_MODEL="gemma3:4b", AI_SUMMARY_EVERY="10")
+                  AI_MODEL="gemma3:4b", AI_SUMMARY_EVERY="10",
+                  # договорённости и шутки в долгой памяти проверяет test_deepmem;
+                  # здесь настоящий эмбеддер растягивал пересборку и сбивал отсчёты
+                  MEM_NOTES="0")
 # корень проекта — на два уровня выше этого файла
 sys.path.insert(0, os.path.dirname(os.path.dirname(
     os.path.dirname(os.path.abspath(__file__)))))
@@ -111,13 +114,13 @@ async def main():
     await db.init()
     cols = await db.columns("settings")
     check("новые колонки настроек дописаны",
-          {"ai_reply", "ai_lang", "ai_vision", "ai_topics", "ai_greeting"} <= cols)
+          {"ai_reply", "ai_lang", "ai_vision", "ai_greeting"} <= cols)
     s = await db.get_settings(CID)
     check("старые значения уцелели",
           (s.ai_random, s.ai_ctx, s.ai_daily, s.ai_len, s.ai_free) == (10, 80, 500, 2, 1))
     check("характер на месте", s.ai_persona == "ехидный торговец")
     check("у новых полей значения по умолчанию",
-          (s.ai_lang, s.ai_vision, s.ai_topics) == (1, 0, 0))
+          (s.ai_lang, s.ai_vision) == (1, 0))
     # ALTER TABLE с DEFAULT заполняет и уже существующие строки: чат из старой
     # базы получает 35%, а не ноль
     check("шанс ответить на ответ себе доехал до старого чата", s.ai_reply == 50)
@@ -144,6 +147,9 @@ async def main():
     check("новые поля пишутся", (fresh.msg_id, fresh.thread_id) == (777, 42))
 
     # --- 3. заметки собираются сами ---
+    # дневник событий — свой запрос к модели после заметок; здесь он мешал бы
+    # смотреть на запрос пересборки, проверяется он в test_deepmem
+    await db.set_setting(CID, "ai_journal", 0)
     ai._ask_ollama = fake_model
     await ai.forget(CID)                      # начинаем с чистого листа
     for i in range(config.AI_SUMMARY_EVERY):
@@ -395,6 +401,152 @@ async def main():
     await store.people_set(CID, [("@vasya", "пьёт")])
     await ai.forget(CID)
     check("и люди забыты", await store.people_count(CID) == 0)
+
+    # --- 8. забыть конкретных людей ---
+    await store.people_set(CID, [("@vasya", "пьёт"), ("@katieboots", "биоинженер"),
+                                 ("Иван Петров", "без юзернейма")])
+    await store.summary_set(CID, "ШУТКИ И ПРОЗВИЩА:\n— @vasya зовёт всех котиками\n"
+                                 "— @katieboots придумала «сковороду»\n"
+                                 "ФАКТЫ О ТЕБЕ:\n— считают умным\n", 5)
+    await store.mood_set(CID, "@vasya", 3.0, 0.0)
+    found = await store.people_forget(CID, ["Vasya", "@kat", "Иван Петров", "@nobody"])
+    left = dict(await store.people_all(CID))
+    notes, covered = await store.summary_get(CID)
+    check("ник без собаки и в другом регистре находится", "Vasya" in found)
+    check("человек без юзернейма — по полному имени", "Иван Петров" in found)
+    check("кого нет — не найден", "@nobody" not in found)
+    check("запись о забытом стёрта", "@vasya" not in left)
+    check("соседа с похожим ником не задело", "@katieboots" in left)
+    check("строка общих заметок о нём ушла", "котиками" not in notes)
+    check("а про другого осталась", "сковороду" in notes and "умным" in notes)
+    check("и отметка пересказа та же", covered == 5)
+    check("счёт грубостей тоже забыт", await store.mood_get(CID, "@vasya") is None)
+
+    # --- 9. тон по человеку ---
+    from slusha import mood
+    check("оскорбление — грубость", mood.tone("Коул ты тупой как пиздец") == -1)
+    check("мат без адресата — не грубость", mood.tone("бля, смешно вышло") == 0)
+    check("спасибо — доброе слово", mood.tone("спасибо коул, ты лучший") == 1)
+    check("грубость перевешивает", mood.tone("спасибо, тупая железка") == -1)
+    for _ in range(2):
+        await mood.note(CID, "@grump", "заткнись уже")
+    await mood.note(CID, "@nice", "спасибо!")
+    await mood.note(CID, "@calm", "а сколько времени?")
+    check("грубиян узнан", "грубит тебе" in await mood.line(CID, "@grump"))
+    check("вежливый — по-доброму", "по-доброму" in await mood.line(CID, "@nice"))
+    check("о незнакомом — тоже по-доброму", "по-доброму" in await mood.line(CID, "@calm"))
+    check("нейтральная реплика счёт не заводит", await store.mood_get(CID, "@calm") is None)
+    r, k, ts = await store.mood_get(CID, "@grump")
+    check("старая грубость выветривается",
+          not mood.rude((r, k, ts - 7 * 24 * 3600)) and mood.rude((r, k, ts)))
+    seen = []
+
+    async def peek(system, messages, tokens, images=None):
+        seen.append(messages[-1]["content"])
+        return "Ну и что."
+    real = ai._ask_ollama
+    ai._ask_ollama = peek
+    s = await db.get_settings(CID)
+    await ai.ask(s, "Чат", CID, "@grump", "ну что, железка?", snapshot=[])
+    check("грубияну в задании — холодный тон", "грубит тебе" in seen[-1])
+    s.ai_mood = 0
+    await ai.ask(s, "Чат", CID, "@grump", "ну что, железка?", snapshot=[])
+    check("выключатель убирает строку тона", "грубит" not in seen[-1]
+          and "по-доброму" not in seen[-1])
+    ai._ask_ollama = real
+    await summary.clear(CID)
+    check("очистка заметок забывает и тон", await store.mood_get(CID, "@grump") is None)
+
+    # --- 10. чужое в описании человека вырезаем ---
+    L = store.Line
+    rows = [L("@mre_mani", "Интересно, а как ты относишься к красным грибам", 1, None),
+            L("@vollychka", "Я сегодня бупропион пью, с алкоголем нельзя", 2, None),
+            L("@leiliron", "ты стоматолог?", 3, None),
+            L("@dentkic", "Йеп", 4, None),
+            L("@mre_mani", "Хочу кофе, но проверка отпиздит за кипячение воды", 5, None)]
+    got = dict(summary._owned([
+        ("@vollychka", "пьёт бупропион, предупреждает о кипячении воды"),
+        ("@imperormisha", "задаёт вопросы о том, как относиться к красным грибам"),
+        ("@dentkic", "называет себя стоматологом"),
+        ("@mre_mani", "спрашивает про красные грибы, критикует @vollychka"),
+    ], rows, {"@imperormisha": "любит энергетики"}))
+    check("чужой кусок вырезан, свой остался",
+          got.get("@vollychka") == "пьёт бупропион")
+    check("запись целиком из чужого не пишется", "@imperormisha" not in got)
+    check("короткий ответ на вопрос — свой", "стоматологом" in got.get("@dentkic", ""))
+    check("упомянутый ник не делает кусок чужим",
+          got.get("@mre_mani") == "спрашивает про красные грибы, критикует @vollychka")
+
+    # --- голые вложения сборщику не показываем ---
+    check("стикер — голое вложение", summary._BARE.match("[стикер 🙂]") is not None)
+    check("текст со скобками — нет", summary._BARE.match("[фото] а вот и я") is None)
+    await store.summary_set(CID, "ФАКТЫ О ТЕБЕ:\n— считают умным\n", 0)
+    _, start = await store.summary_get(CID)
+    for i in range(30):
+        await store.add(CID, "@sticker", "[стикер 🙂]", 5000 + i)
+    calls = []
+
+    async def count_calls(system, messages, tokens, images=None):
+        calls.append(1)
+        return ""
+    ai._ask_ollama = count_calls
+    await summary._compact(CID)
+    _, after = await store.summary_get(CID)
+    check("одни стикеры — модель не зовём", not calls)
+    check("и отметку пересказа двигаем", after > start)
+    ai._ask_ollama = real
+
+    # --- 11. факты о собеседнике по теме реплики ---
+    await store.people_set(CID, [("@courier", "работает курьером, планирует поездку в Японию; "
+                                              "любит котов")])
+    got = await summary.recall(CID, "@courier", "Коул, на работе завал", ["Белизарий Коул"])
+    check("факт по теме найден", "курьером" in got and "Японию" not in got)
+    check("и только он", "котов" not in got)
+    check("без совпадения — пусто",
+          await summary.recall(CID, "@courier", "что посмотреть вечером?") == "")
+    check("имя бота совпадением не считается",
+          await summary.recall(CID, "@courier", "Коул, привет", ["Коул"]) == "")
+    check("о незнакомом — пусто", await summary.recall(CID, "@nobody", "работа") == "")
+
+    # --- 12. незакрытые темы ---
+    from slusha import plans
+    # среда, 1 октября 2025, 20:00 по Москве
+    wed = 1759338000
+    day = 86400
+    span = plans.detect("Завтра сдавать чертежи а я не сделал", wed)
+    check("«завтра» — спрашивать с вечера четверга",
+          span and span[0] == wed + day - 3 * 3600 and span[1] == span[0] + plans.ASK_DAYS * day)
+    span = plans.detect("в пятницу иду на собес", wed)
+    check("«в пятницу» — с вечера пятницы", span and span[0] == wed + 2 * day - 3 * 3600)
+    span = plans.detect("на выходных еду на дачу", wed)
+    check("«на выходных» — с субботы", span and span[0] == wed + 3 * day - 3 * 3600)
+    span = plans.detect("сегодня вечером у меня концерт", wed)
+    check("«сегодня вечером» — наутро", span and span[0] == wed + 12 * 3600)
+    check("вопрос — не план", plans.detect("завтра пойдём гулять?", wed) is None)
+    check("«до завтра» — не план", plans.detect("я работать буду до завтра", wed) is None)
+    check("без первого лица — не план", plans.detect("завтра обещают дождь", wed) is None)
+
+    await store.plan_add(CID, "@student", "Завтра сдавать чертежи", 100, 0, 2**31, 3)
+    await store.plan_add(CID, "@told", "Завтра сдавать чертежи", 100, 0, 2**31, 3)
+    await store.plan_add(CID, "@early", "в пятницу собес", 100, 2**31 - 10, 2**31, 3)
+    told = [store.Line("@told", "сдал чертежи, ура", ts=200)]
+    first = await plans.line(CID, "@student")
+    check("созревший план — в задание", "чертежи" in first and "как прошло" in first)
+    check("спрашиваем один раз", await plans.line(CID, "@student") == "")
+    check("уже рассказал сам — не спрашиваем", await plans.line(CID, "@told", told) == "")
+    check("рано — не спрашиваем", await plans.line(CID, "@early") == "")
+    check("в меню виден", any(w == "@early" for w, _, _ in await store.plans_open(CID)))
+    found = await store.people_forget(CID, ["@early"])
+    check("забыть человека — забыть и его планы",
+          "@early" in found and not await store.plans_open(CID))
+
+    seen.clear()
+    ai._ask_ollama = peek
+    s = await db.get_settings(CID)
+    await store.plan_add(CID, "@courier", "завтра у меня собес в яндекс", 100, 0, 2**31, 3)
+    await ai.ask(s, "Чат", CID, "@courier", "Коул, на работе завал", snapshot=[])
+    check("в задании — и факт, и план", "курьером" in seen[-1] and "собес" in seen[-1])
+    ai._ask_ollama = real
 
     await store.close()
     await db.close()

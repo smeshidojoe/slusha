@@ -5,7 +5,7 @@ Telegram (её проверяет auth), а каждый запрос про ч�
 владеет ли этот человек этим чатом. Ровно как _guard в меню: id чата приходит
 снаружи, и подставить чужой ничего не стоит.
 
-Логику не дублируем: где меню зовёт lore, ai или db, панель зовёт их же.
+Логику не дублируем: где меню зовёт card, ai или db, панель зовёт их же.
 Иначе два интерфейса неизбежно разъедутся в поведении.
 """
 import json
@@ -13,7 +13,7 @@ import logging
 
 from aiohttp import web
 
-from .. import ai, config, db, history as store, lore, schema, summary
+from .. import ai, card as cards, config, db, history as store, schema, summary
 
 logger = logging.getLogger("slusha.web.api")
 
@@ -80,6 +80,11 @@ async def chat(request: web.Request) -> web.Response:
     ch = await db.get_chat(cid)
     s = await db.get_settings(cid)
     notes, covered = await store.summary_get(cid)
+    from .. import memory
+    kept = await memory.notes_all(cid) if memory.notes_on() else []
+    if kept:
+        notes = summary._fill(notes, {k: [r["text"] for r in kept if r["kind"] == k][:8]
+                                      for k in memory.NOTE_KINDS.values()})
     return js({
         "chat_id": cid,
         "title": ch["title"] if ch else str(cid),
@@ -96,7 +101,6 @@ async def chat(request: web.Request) -> web.Response:
         "notes_pending": await store.pending(cid, covered),
         "notes_updated": await store.summary_updated(cid),
         "notes_limit": config.AI_SUMMARY_LIMIT,
-        "lore": [dict(r) for r in await db.lore_list(cid)],
     })
 
 
@@ -159,39 +163,9 @@ async def names(request: web.Request) -> web.Response:
     return js({"ok": True})
 
 
-@routes.post("/api/chat/{cid}/lore")
-async def lore_add(request: web.Request) -> web.Response:
-    cid = await _chat_id(request)
-    data = await _body(request)
-    content = (data.get("content") or "").strip()[:1500]
-    if not content:
-        raise web.HTTPBadRequest(text="Пустая запись")
-    keys = (data.get("keys") or "").strip()[:300]
-    always = 1 if keys in ("", "*") else 0
-    row_id = await db.lore_add(cid, "" if always else keys, content, always)
-    return js({"ok": True, "id": row_id})
-
-
-@routes.delete("/api/chat/{cid}/lore/{rid}")
-async def lore_del(request: web.Request) -> web.Response:
-    await _chat_id(request)
-    try:
-        rid = int(request.match_info["rid"])
-    except ValueError:
-        raise web.HTTPBadRequest(text="Плохой id записи")
-    await db.lore_remove(rid)
-    return js({"ok": True})
-
-
-@routes.post("/api/chat/{cid}/lore/clear")
-async def lore_clear(request: web.Request) -> web.Response:
-    cid = await _chat_id(request)
-    return js({"ok": True, "dropped": await db.lore_clear(cid)})
-
-
 @routes.post("/api/chat/{cid}/upload")
 async def upload(request: web.Request) -> web.Response:
-    """Файл с chub.ai: и книга лора, и карточка персонажа — как в меню."""
+    """Карточка персонажа с chub.ai — как в меню."""
     cid = await _chat_id(request)
     reader = await request.multipart()
     field = await reader.next()
@@ -200,11 +174,11 @@ async def upload(request: web.Request) -> web.Response:
     raw = await field.read(decode=False)
     if len(raw) > config.WEB_UPLOAD_MAX:
         raise web.HTTPBadRequest(text="Файл больше 5 МБ, это не карточка")
-    result = await lore.import_file(cid, raw)
+    result = cards.load(raw)
     if result.get("error"):
         raise web.HTTPBadRequest(text=result["error"])
-    done = await lore.apply_card(cid, result.get("card") or {})
-    return js({"ok": True, "entries": result["entries"], "card": done})
+    done = await cards.apply_card(cid, result.get("card") or {})
+    return js({"ok": True, "card": done})
 
 
 @routes.post("/api/chat/{cid}/forget")

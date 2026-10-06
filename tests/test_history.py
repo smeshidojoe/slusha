@@ -103,6 +103,151 @@ async def main():
     check("на голое вложение бот не отвечает", len(SENT) == before)
     check("но в историю оно попало", (await ai.history(CID, 1))[0][1] == "[фото]")
 
+    # --- 2б. стикеры: боту — описание словами, остальным — только метка ---
+    from slusha import vision
+    import io
+
+    class StickerBot(FakeBot):
+        downloads = 0
+
+        async def download(self, fid):
+            StickerBot.downloads += 1
+            return io.BytesIO(b"RIFF\x00\x00\x00\x00WEBPVP8 ")
+
+    seen_calls = []
+
+    async def fake_seeing(system, messages, tokens=0, images=None):
+        if images and messages[-1]["content"] == ai._SEE_STICKER:
+            seen_calls.append(images)
+            return "Стикер с грустной лягушкой [мем]."
+        SENT.append(messages)
+        return "ответ"
+
+    ai._ask_ollama = fake_seeing
+    sbot = StickerBot()
+    own = SimpleNamespace(message_id=500, text="Ты опять за своё.", caption=None,
+                          from_user=SimpleNamespace(id=1000, is_bot=True))
+    static = SimpleNamespace(emoji="😞", file_id="s1", file_unique_id="u1",
+                             file_size=900, is_animated=False, is_video=False,
+                             thumbnail=None)
+    animated = SimpleNamespace(emoji="😂", file_id="a1", file_unique_id="u2",
+                               file_size=900, is_animated=True, is_video=False,
+                               thumbnail=SimpleNamespace(file_id="t2", file_size=300))
+    bare_anim = SimpleNamespace(emoji="😂", file_id="a3", file_unique_id="u3",
+                                is_animated=True, is_video=False, thumbnail=None)
+    check("обычный стикер показываем сам", vision._sticker(msg(sticker=static)) is static)
+    check("анимированный — превью", vision._sticker(msg(sticker=animated)) is animated.thumbnail)
+    check("без превью показать нечем", not vision.has_sticker(msg(sticker=bare_anim)))
+    check("webp так и называем", ai._mime("UklGRgAAAABXRUJQ") == "image/webp")
+    check("jpeg по умолчанию", ai._mime("/9j/4AAQ") == "image/jpeg")
+
+    await db.set_setting(CID, "ai_reply", 100)
+    await db.set_setting(CID, "ai_vision", 1)
+    s = await db.get_settings(CID)
+    ai._last_reply.clear()
+    before = len(SENT)
+    await ai.maybe_reply(sbot, msg(sticker=static, message_id=501, reply_to_message=own), s)
+    await asyncio.sleep(0.2)
+    last = [r[1] for r in await ai.history(CID, 3) if r[1].startswith("[стикер")][-1]
+    check(f"стикер боту описан словами: {last}", last == "[стикер 😞: с грустной лягушкой (мем)]")
+    check("и бот на него ответил", len(SENT) == before + 1)
+    flat = str(SENT[-1])
+    check("в задании описание, а не картинка", "грустной лягушкой" in flat)
+
+    ai._last_reply.clear()
+    await ai.maybe_reply(sbot, msg(sticker=static, message_id=502, reply_to_message=own), s)
+    await asyncio.sleep(0.2)
+    check("тот же стикер второй раз не описываем", len(seen_calls) == 1)
+    check("и не скачиваем", StickerBot.downloads == 1)
+
+    ai._last_reply.clear()
+    before = len(SENT)
+    await ai.maybe_reply(sbot, msg(sticker=animated, message_id=503), s)
+    await asyncio.sleep(0.2)
+    check("стикер не боту — только метка", (await ai.history(CID, 1))[0][1] == "[стикер 😂]")
+    check("и без ответа и описания", len(SENT) == before and len(seen_calls) == 1)
+
+    ai._last_reply.clear()
+    before = len(SENT)
+    await ai.maybe_reply(sbot, msg(sticker=bare_anim, message_id=504, reply_to_message=own), s)
+    await asyncio.sleep(0.2)
+    check("не разглядели — молчим", len(SENT) == before)
+    check("но метку запомнили", (await ai.history(CID, 1))[0][1] == "[стикер 😂]")
+
+    await db.set_setting(CID, "ai_reply", 0)
+    s = await db.get_settings(CID)
+    ai._last_reply.clear()
+    await ai.maybe_reply(sbot, msg(sticker=animated, message_id=505, reply_to_message=own), s)
+    await asyncio.sleep(0.2)
+    check("реплаи выключены — на стикер не отвечаем", len(SENT) == before)
+    check("и не тратим модель на описание", len(seen_calls) == 1)
+
+    theirs = SimpleNamespace(message_id=506, sticker=animated, photo=None,
+                             text=None, caption=None,
+                             from_user=SimpleNamespace(id=8, username="petya",
+                                                       full_name="Петя", is_bot=False))
+    got = await vision.grab(sbot, msg("что это?", message_id=507, reply_to_message=theirs))
+    check("стикер, на который отвечают, идёт картинкой", len(got) == 1)
+    got = await vision.grab(sbot, msg(sticker=static, message_id=508))
+    check("свой стикер картинкой не шлём — он уже словами", got == [])
+
+    # вопрос текстом на стикер — описание в самом вопросе, без картинки
+    pics = []
+
+    async def fake_seeing2(system, messages, tokens=0, images=None):
+        if images and messages[-1]["content"] == ai._SEE_STICKER:
+            seen_calls.append(images)
+            return "Утёнок в панике"
+        pics.append(images)
+        SENT.append(messages)
+        return "утёнок паникует, а ты нет"
+
+    async def always(*a, **k):
+        return True
+
+    ai._ask_ollama = fake_seeing2
+    real_should = ai.should_reply
+    ai.should_reply = always
+    await db.set_setting(CID, "ai_reply", 50)
+    s = await db.get_settings(CID)
+    ai._last_reply.clear()
+    before = len(SENT)
+    await ai.maybe_reply(sbot, msg("что тут?", message_id=509, reply_to_message=theirs), s)
+    await asyncio.sleep(0.2)
+    check("на вопрос про стикер ответили", len(SENT) == before + 1)
+    flat = str(SENT[-1])
+    check("описание стикера в вопросе",
+          "что тут? [в ответ на стикер 😂: Утёнок в панике]" in flat)
+    check("вопрос в переписке один раз", flat.count("@vasya: что тут?") == 1)
+    check("картинку стикера не прикладываем", not pics[-1])
+    mine = [r[1] for r in await ai.history(CID, 4) if r[1].startswith("что тут")]
+    check(f"в историю — без описания: {mine}", mine == ["что тут?"])
+
+    # фото с подписью — описание в вопросе, картинка остаётся
+    async def fake_seeing3(system, messages, tokens=0, images=None):
+        if images and messages[-1]["content"] == ai._SEE_PHOTO:
+            return "На картинке изображен интерфейс Steam с модами [Wallpaper Engine]."
+        pics.append(images)
+        SENT.append(messages)
+        return "моды так себе"
+
+    ai._ask_ollama = fake_seeing3
+    ai._last_reply.clear()
+    shot = [SimpleNamespace(file_id="p1", file_unique_id="pu1", file_size=900,
+                            width=800, height=600)]
+    await ai.maybe_reply(sbot, msg(caption="вот такая штука", message_id=510, photo=shot), s)
+    await asyncio.sleep(0.2)
+    flat = str(SENT[-1])
+    check("описание фото в вопросе",
+          "вот такая штука [на фото: интерфейс Steam с модами (Wallpaper Engine)]" in flat)
+    check("картинка фото остаётся", bool(pics[-1]))
+    mine = [r[1] for r in await ai.history(CID, 4) if r[1].startswith("вот такая")]
+    check(f"фото в историю — без описания: {mine}", mine == ["вот такая штука"])
+    ai.should_reply = real_should
+    ai._ask_ollama = fake_ollama
+    await db.set_setting(CID, "ai_reply", 50)
+    s = await db.get_settings(CID)
+
     # --- 3. чистка хвоста пачками ---
     for i in range(history.KEEP + history.PRUNE_EVERY + 5):
         await ai.remember(CID, "@vasya", f"строка {i}")

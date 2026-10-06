@@ -148,6 +148,46 @@ async def main():
     # --- 6. окно контекста ---
     check("num_ctx поднят до 16384", config.AI_NUM_CTX == 16384)
 
+    # --- 7. привычки: зачин, своё имя, свои цитаты в заметках ---
+    recent = ["Ёпта, пизда! Ну да, фута.", "Да ладно тебе. Не кипишь.",
+              "Ёпта, пизда! Свинья с радио?"]
+    check("прилипший зачин пойман, хоть его и говорил человек",
+          ai.hooked("Ёпта, пизда! Да ты серьёзно?", recent, ["Я говорил Ёпта пизда"])
+          == "Ёпта, пизда")
+    check("зачин один раз — не привычка",
+          ai.hooked("Да ладно тебе, Миша! Детям лучшее.", recent) == "")
+    names = ["яни", "таба", "кошка"]
+    check("своё имя в обращении вырезано",
+          ai.strip_self_address("С днём рожденья, таба! Торт с меня.", names)
+          == "С днём рожденья! Торт с меня.")
+    check("и в начале", ai.strip_self_address("Таба, ну ты чего?", names) == "Ну ты чего?")
+    check("имя без обращения остаётся",
+          ai.strip_self_address("Ну ты и кошка, конечно.", names) == "Ну ты и кошка, конечно.")
+    from slusha import summary
+    notes = ("ФАКТЫ О ТЕБЕ:\n— Ты считаешься «овощем».\n"
+             "— Бот предлагает расслабиться (“Ёпта, пизда! Да брось ты, что платить за дружбу?”).")
+    check("образец из задания вырезан из записи о человеке",
+          summary._junk([("@a", "чем занят, что о нём известно, как разговаривает. "
+                                "(Смешливый, часто шутит.)"),
+                         ("@b", "чем занят, что о нём известно, как разговаривает.")])
+          == [("@a", "Смешливый, часто шутит.")])
+    was = (config.AI_COLLECT_MODEL, config.AI_PROVIDER)
+    config.AI_COLLECT_MODEL = "gemma3:12b"
+    with ai.collecting():
+        on = ai._collect.get()
+        wait = ai._timeout()
+    check("сборщик идёт к своей модели, если она задана и это Ollama",
+          on == (ai.mode() == "ollama")
+          and (wait == config.AI_COLLECT_TIMEOUT if on else True))
+    check("вне блока — обычная модель", not ai._collect.get())
+    config.AI_COLLECT_MODEL = ""
+    with ai.collecting():
+        check("без настройки блок ничего не меняет", not ai._collect.get())
+    config.AI_COLLECT_MODEL = was[0]
+    check("своя цитата внутри строки заметок вырезана",
+          summary._drop_own(notes, ["Ёпта, пизда! Да брось ты, что платить за дружбу?"])
+          == "ФАКТЫ О ТЕБЕ:\n— Ты считаешься «овощем».")
+
     from slusha import history as store
     await store.close()
 

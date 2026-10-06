@@ -106,6 +106,23 @@ PAUSE_MARK = int(os.getenv("AI_PAUSE_MARK") or 1800)
 
 AI_MAX_CHARS = int(os.getenv("AI_MAX_CHARS") or 600)
 AI_TIMEOUT = 40              # сек на запрос, дальше молчим
+# Пересборку заметок никто не ждёт, а в очереди за ответами она не
+# укладывалась в 40 с — заметки не обновлялись часами.
+AI_SUMMARY_TIMEOUT = int(os.getenv("AI_SUMMARY_TIMEOUT") or 150)
+
+# Модель сборщика журнала событий (memory.py). Ответа от него никто
+# не ждёт, поэтому ему можно модель крупнее той, что говорит в чате, и на
+# процессоре: видеокарту держит модель ответов, и чужая модель вытеснила бы
+# её оттуда. На эталоне из 27 событий живого чата gemma3:4b находила 10 и
+# путала «надо переехать» с «переехала»; gemma3:12b — больше и без этого.
+# Пусто — сборщик работает на той же модели, что и ответы.
+AI_COLLECT_MODEL = os.getenv("AI_COLLECT_MODEL", "")
+AI_COLLECT_CPU = int(os.getenv("AI_COLLECT_CPU") or 1)          # 1 — без видеокарты
+# потоков процессора: остальные ядра — людям за этим компьютером
+AI_COLLECT_THREADS = int(os.getenv("AI_COLLECT_THREADS") or 4)
+AI_COLLECT_CTX = int(os.getenv("AI_COLLECT_CTX") or 8192)
+# на процессоре 12b пишет пару токенов в секунду: заметки — минуты
+AI_COLLECT_TIMEOUT = int(os.getenv("AI_COLLECT_TIMEOUT") or 1800)
 AI_COOLDOWN = 8              # пауза между ответами в одном чате, сек
 AI_HISTORY = 200             # сколько сообщений чата держим в памяти
 AI_PARTS = 3                 # на сколько сообщений максимум дробим ответ
@@ -258,7 +275,7 @@ AI_PERSONA_LIMIT = int(os.getenv("AI_PERSONA_LIMIT") or 8000)
 AI_PERSONA_SOFT = int(os.getenv("AI_PERSONA_SOFT") or 2000)
 
 # Примеры реплик персонажа из карточки (mes_example). Строк берём
-# немного: это образец манеры, а не второй лорбук.
+# немного: это образец манеры, а не второй характер.
 # Шесть строк — это три обмена. У карточек с chub примеров бывает вдвое
 # больше, и хвост списка модель не видела вовсе: в чате стояли десять
 # обменов, а работали первые три. Восемь — компромисс: манеру задаёт
@@ -274,13 +291,10 @@ AI_NAMES_SHOWN = int(os.getenv("AI_NAMES_SHOWN") or 3)
 
 AI_EXAMPLE_LIMIT = int(os.getenv("AI_EXAMPLE_LIMIT") or 1200)
 
-LORE_BUDGET = int(os.getenv("LORE_BUDGET") or 1500)
-LORE_LIMIT = 200
-
 # ---------- веб-панель ----------
 #
 # То же самое, что инлайн-меню, но страницей: список чатов не листается по
-# восемь штук, характер видно целиком, лорбук правится без диалога с ботом.
+# восемь штук, характер видно целиком и правится без диалога с ботом.
 # Живёт в том же процессе — ей нужны та же база и тот же объект Bot.
 # Наружу порт выводит туннель (ngrok, cloudflared): мини-приложение Telegram
 # открывает только по https, а заводить сертификат ради одной страницы незачем.
@@ -299,3 +313,42 @@ AI_PERSONA_DEFAULT = (
     "без морали и канцелярита. Можешь язвить, но не унижаешь людей и не лезешь "
     "в политику. Если сказать нечего — отвечай одной фразой."
 )
+
+# ---------- поиск в интернете (search.py) ----------
+# Адрес своего SearXNG. Пустой — поиска нет, просьбы «покажи» бот отвечает словами.
+SEARCH_URL = (os.getenv("SEARCH_URL") or "").rstrip("/")
+# Куда складываем найденные картинки. В образе — /app/search, смонтирован с хоста.
+SEARCH_DIR = os.getenv("SEARCH_DIR") or os.path.join(BASE_DIR, "search")
+SEARCH_LANG = os.getenv("SEARCH_LANG") or "ru"
+SEARCH_TIMEOUT = int(os.getenv("SEARCH_TIMEOUT") or 15)
+# Поисков на чат в сутки: каждый — до шести скачанных картинок и десятка
+# вопросов модели, а поисковики банят частые запросы с одного адреса.
+SEARCH_DAILY = int(os.getenv("SEARCH_DAILY") or 30)
+# Что искать на «покажи себя»: персонаж с каноном («Belisarius Cawl art»).
+# Пусто — своего фото у персонажа нет, отвечает словами.
+SEARCH_SELF = os.getenv("SEARCH_SELF") or ""
+
+# ---------- долгая память (memory.py) ----------
+# Эмбеддинги для поиска по смыслу. bge-m3 понимает русский; на процессоре,
+# чтобы не отнимать видеокарту у основной модели (num_gpu 0).
+MEM_EMBED_MODEL = os.getenv("MEM_EMBED_MODEL", "bge-m3")
+MEM_EMBED_GPU = int(os.getenv("MEM_EMBED_GPU") or 0)
+# Адрес Ollama для эмбеддингов. Пусто — тот же, что у основной модели (если это Ollama).
+MEM_EMBED_URL = (os.getenv("MEM_EMBED_URL") or "").rstrip("/")
+# Насколько кусок памяти должен быть ближе к реплике, чем фон (см. memory.closest)
+MEM_MARGIN = float(os.getenv("MEM_MARGIN") or 0.10)
+# Журнал событий: ниже этой важности не пишем; в ответ — не больше стольких событий
+MEM_MIN_IMPORTANCE = int(os.getenv("MEM_MIN_IMPORTANCE") or 4)
+MEM_EVENTS = int(os.getenv("MEM_EVENTS") or 1)
+# Договорённости и шутки из заметок — в долгую память: при пересборке они
+# больше не выпадают, а в запрос идут только подходящие к разговору, не больше
+# MEM_NOTES_SHOWN. 0 — по-старому, все строки в каждом запросе.
+MEM_NOTES = int(os.getenv("MEM_NOTES") or 1)
+MEM_NOTES_SHOWN = int(os.getenv("MEM_NOTES_SHOWN") or 3)
+# по скольким последним репликам подбирать
+MEM_NOTES_TALK = int(os.getenv("MEM_NOTES_TALK") or 6)
+# Ночная уборка дневника: в этот час; неважное, что не пригодилось, забываем через N дней
+MEM_NIGHT_HOUR = int(os.getenv("MEM_NIGHT_HOUR") or 5)
+MEM_FORGET_DAYS = int(os.getenv("MEM_FORGET_DAYS") or 30)
+# Хранилище Obsidian: папка на чат, пересобирается каждую ночь
+MEM_VAULT = os.getenv("MEM_VAULT") or os.path.join(BASE_DIR, "vault")

@@ -15,6 +15,10 @@ services:
       SLUSHA_LOG_PATH: /app/data/slusha.log
       # внутри контейнера слушаем все адреса — наружу пускает только ports выше
       SLUSHA_WEB_HOST: 0.0.0.0
+      # найденные в интернете картинки — в папку search рядом с ботом
+      SEARCH_DIR: /app/search
+      # память чата для Obsidian — папка vault рядом с ботом
+      MEM_VAULT: /app/vault
 
     # чтобы контейнер видел локальную Ollama на хосте
     # (AI_BASE_URL=http://host.docker.internal:11434)
@@ -29,6 +33,8 @@ services:
     volumes:
       - ./.env:/app/slusha/.env:ro   # только чтение: контейнер его не меняет
       - ./data:/app/data             # база и лог живут рядом с ботом
+      - ./search:/app/search         # картинки из поиска
+      - ./vault:/app/vault           # хранилище Obsidian
 
     mem_limit: 4g
     memswap_limit: 4g

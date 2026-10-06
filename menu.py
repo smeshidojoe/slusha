@@ -1,6 +1,6 @@
 """Меню бота-собеседника. Всё живёт в одном сообщении, как у модератора.
 
-Разделов тут мало: чаты, настройки разума на чат, лорбук и список допуска.
+Разделов тут мало: чаты, настройки разума на чат и список допуска.
 Модерации нет вовсе — этот бот только разговаривает.
 """
 import logging
@@ -14,7 +14,7 @@ from aiogram.types import (CallbackQuery, InlineKeyboardButton, InlineKeyboardMa
                            Message, WebAppInfo)
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
-from . import ai, config, db, history as store, lore, schema, utils
+from . import ai, card as cards, config, db, history as store, schema, utils
 
 logger = logging.getLogger("slusha.menu")
 
@@ -44,7 +44,6 @@ router = Router()
 router.message.filter(F.chat.type == "private")
 
 CHATS_PER_PAGE = 8
-LORE_PER_PAGE = 6
 
 _HOME = ("<b>🧠 Слюша</b>\n\nБот-собеседник. Добавьте его в чат, включите разум "
          "и настройте характер.")
@@ -54,9 +53,8 @@ class Input(StatesGroup):
     persona = State()     # ждём текст характера или файл карточки
     names = State()       # ждём имена-обращения
     examples = State()    # ждём примеры реплик
-    lore_file = State()   # ждём файл лорбука
-    lore_entry = State()  # ждём запись «ключи | текст»
     access = State()      # ждём id/@username для доступа
+    forget_people = State()  # ждём ники, кого забыть
 
 
 def _btn(text: str, data: str) -> InlineKeyboardButton:
@@ -154,7 +152,6 @@ async def view_chat(cid: int) -> tuple[str, InlineKeyboardMarkup]:
     b.row(_btn(f"🎭 Характер: {persona}", f"m:persona:{cid}"))
     b.row(_btn(f"💬 Примеры реплик: {ex or 'нет'}", f"m:ex:{cid}"))
     b.row(_btn(f"🔔 Имена-обращения: {names}", f"m:names:{cid}"))
-    b.row(_btn(f"📚 Лорбук: {await db.lore_count(cid)}", f"m:lore:{cid}:0"))
     b.row(_btn(f"🧠 Заметки о чате: {notes}", f"m:sum:{cid}"))
     b.row(_btn("🧹 Забыть переписку", f"m:forget:{cid}"))
     b.row(InlineKeyboardButton(text="🚪 Убрать бота из чата",
@@ -163,51 +160,16 @@ async def view_chat(cid: int) -> tuple[str, InlineKeyboardMarkup]:
     return "\n".join(lines), b.as_markup()
 
 
-async def view_lore(cid: int, page: int = 0) -> tuple[str, InlineKeyboardMarkup]:
-    rows = await db.lore_list(cid)
-    pages = max(1, -(-len(rows) // LORE_PER_PAGE))
-    page = max(0, min(page, pages - 1))
-    chunk = rows[page * LORE_PER_PAGE:(page + 1) * LORE_PER_PAGE]
-
-    lines = [
-        "<b>📚 Лорбук</b>\n",
-        "Записи подмешиваются в промпт, когда в разговоре встречается их "
-        "ключевое слово. Записи «всегда» идут в каждый запрос. Если ничего не "
-        "совпало, бот всё равно берёт кусочек книги по кругу — чтобы мир "
-        "чувствовался.\n"
-        "Можно загрузить файл с chub.ai: и книгу, и карточку персонажа.\n",
-        f"Всего записей: <b>{len(rows)}</b>"
-        + (f" · страница {page + 1} из {pages}" if pages > 1 else ""),
-        "",
-    ]
-    if not rows:
-        lines.append("Пока пусто.")
-    b = InlineKeyboardBuilder()
-    for i, r in enumerate(chunk, page * LORE_PER_PAGE + 1):
-        mark = "📌" if r["always"] else "🔑"
-        lines.append(f"{i}. {mark} <b>{utils.esc(r['keys'] or 'без ключей')}</b>\n"
-                     f"<i>{utils.esc(r['content'][:120])}</i>")
-        b.row(_btn(f"❌ {i}. {(r['keys'] or r['content'])[:26]}",
-                   f"m:lored:{cid}:{r['id']}:{page}"))
-    if pages > 1:
-        b.row(_btn("◀", f"m:lore:{cid}:{(page - 1) % pages}"),
-              _btn(f"{page + 1}/{pages}", f"m:lore:{cid}:{page}"),
-              _btn("▶", f"m:lore:{cid}:{(page + 1) % pages}"))
-    b.row(InlineKeyboardButton(text="📥 Загрузить файл",
-                               callback_data=f"m:loreimp:{cid}", style="success"))
-    b.row(_btn("➕ Своя запись", f"m:loreadd:{cid}"))
-    if rows:
-        b.row(InlineKeyboardButton(text="🗑 Очистить книгу",
-                                   callback_data=f"m:loreclr:{cid}", style="danger"))
-    b.row(_btn("⬅️ Назад", f"m:c:{cid}"))
-    return "\n".join(lines), b.as_markup()
-
-
 async def view_notes(cid: int) -> tuple[str, InlineKeyboardMarkup]:
     """Что бот запомнил о чате сверх окна контекста."""
-    from . import summary
+    from . import memory, summary
     await summary.block(cid)          # старые заметки с людьми внутри — разложить
     text, covered = await store.summary_get(cid)
+    # договорённости и шутки живут в долгой памяти: показываем свежие оттуда
+    kept = await memory.notes_all(cid) if memory.notes_on() else []
+    if kept:
+        text = summary._fill(text, {k: [r["text"] for r in kept if r["kind"] == k][:8]
+                                    for k in memory.NOTE_KINDS.values()})
     people = await store.people_all(cid)
     left = await store.pending(cid, covered)
     when = await store.summary_updated(cid)
@@ -223,10 +185,24 @@ async def view_notes(cid: int) -> tuple[str, InlineKeyboardMarkup]:
         f"(пересобирает каждые {config.AI_SUMMARY_EVERY}, потолок заметок — "
         f"{config.AI_SUMMARY_LIMIT} знаков).\n",
     ]
+    if kept:
+        deals = sum(r["kind"] == "deal" for r in kept)
+        lines.append(f"Договорённости и шутки копятся в долгой памяти: <b>{deals}</b> и "
+                     f"<b>{len(kept) - deals}</b>. В запрос идут только подходящие к "
+                     f"разговору (до {config.MEM_NOTES_SHOWN}), здесь — свежие.\n")
+    # Кого бот держит за грубияна — самым верхом: с ними он говорит холодно,
+    # и если человек исправился, его видно и можно забыть.
+    from . import mood
+    grumps = [m[3] for m in (await store.mood_all(cid)).values() if mood.rude(m)]
+    full = f"ГРУБЯТ БОТУ: {', '.join(grumps)}\n\n" if grumps else ""
+    # Незакрытые темы: о чём бот спросит, когда человек ему напишет.
+    later = await store.plans_open(cid)
+    if later:
+        full += "СПРОСИТ, КАК ПРОШЛО:\n" + "\n".join(
+            f"— {w} — «{t[:80]}» (с {utils.stamp(ts)})" for w, t, ts in later) + "\n\n"
     # Люди — первыми и свежие вперёд: их записи меняются чаще всего.
-    full = ""
     if people:
-        full = f"ЛЮДИ ({len(people)}):\n" + "\n".join(f"— {w} — {d}" for w, d in people)
+        full += f"ЛЮДИ ({len(people)}):\n" + "\n".join(f"— {w} — {d}" for w, d in people)
     if text.strip():
         full = (full + "\n\n" + text.strip()).strip()
     if full:
@@ -244,6 +220,8 @@ async def view_notes(cid: int) -> tuple[str, InlineKeyboardMarkup]:
         lines.append("Пока пусто — бот ещё не набрал материала.")
 
     b = InlineKeyboardBuilder()
+    if full:
+        b.row(_btn("🧽 Забыть людей", f"m:sumppl:{cid}"))
     if full:
         b.row(InlineKeyboardButton(text="🗑 Очистить заметки",
                                    callback_data=f"m:sumclr:{cid}", style="danger"))
@@ -453,6 +431,52 @@ async def cb_notes_clear(cb: CallbackQuery) -> None:
     await _show(cb, await view_notes(cid), "Заметки очищены")
 
 
+@router.callback_query(F.data.startswith("m:sumppl:"))
+async def cb_notes_people(cb: CallbackQuery, state: FSMContext) -> None:
+    cid = int(cb.data.split(":")[2])
+    if not await _guard(cb, cid):
+        return
+    await _ask(
+        cb, state, Input.forget_people,
+        "<b>🧽 Забыть людей</b>\n\nПришлите ники тех, кого бот должен забыть: "
+        "через пробел, запятую или с новой строки — <code>@vasya, @petya</code>. "
+        "У кого нет юзернейма — имя целиком, как в заметках, каждое с новой "
+        "строки.\n\nСотрётся запись о человеке, его строки в общих заметках и "
+        "счёт грубостей боту. Переписка в окне контекста останется.",
+        f"m:sum:{cid}", cid=cid,
+    )
+
+
+def _nicks(text: str) -> list[str]:
+    """Ники из ввода: «@a @b, @c» и полные имена без юзернейма по строке."""
+    out = []
+    for chunk in re.split(r"[,;\n]+", text):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        if "@" in chunk:
+            out += [w for w in chunk.split() if w.strip("@")]
+        else:
+            out.append(chunk)
+    return out
+
+
+@router.message(StateFilter(Input.forget_people))
+async def notes_people_input(message: Message, state: FSMContext, bot: Bot) -> None:
+    cid = (await state.get_data())["cid"]
+    whos = _nicks(message.text or "")
+    if not whos:
+        await _retry(message, bot, state,
+                     "<b>🧽 Забыть людей</b>\n\n⚠️ Пришлите хотя бы один ник.")
+        return
+    found = await store.people_forget(cid, whos)
+    missed = [w for w in whos if w.strip() not in found]
+    note = (f"✅ Забыты: {utils.esc(', '.join(found))}.\n" if found else "")
+    if missed:
+        note += f"🤷 Не нашёл: {utils.esc(', '.join(missed))}.\n"
+    await _finish(message, bot, state, await view_notes(cid), note + "\n")
+
+
 @router.callback_query(F.data.startswith("m:forget:"))
 async def cb_forget(cb: CallbackQuery) -> None:
     cid = int(cb.data.split(":")[2])
@@ -490,7 +514,7 @@ async def cb_persona(cb: CallbackQuery, state: FSMContext) -> None:
         "<b>🎭 Характер</b>\n\nОпишите, кто такой бот и как он говорит — это "
         "уходит модели как инструкция.\n"
         "Можно прислать <b>файл карточки</b> с chub.ai (JSON или PNG): возьму "
-        "описание, имя, примеры реплик и книгу лора, если она внутри.\n"
+        "описание, имя, примеры реплик и приветствие.\n"
         f"<b>Длина важна.</b> Характер уезжает в модель на каждый запрос и "
         f"делит окно с историей чата: на пять тысяч знаков он занимает половину "
         f"промпта, и вопрос собеседника в нём тонет. Рабочий размер — до "
@@ -512,20 +536,17 @@ async def persona_input(message: Message, state: FSMContext, bot: Bot) -> None:
                          "<b>🎭 Характер</b>\n\n⚠️ Файл больше 5 МБ, это не карточка.")
             return
         buf = await bot.download(doc.file_id)
-        result = await lore.import_file(cid, buf.read())
+        result = cards.load(buf.read())
         if result.get("error"):
             await _retry(message, bot, state, f"<b>🎭 Характер</b>\n\n⚠️ {result['error']}")
             return
         card = result.get("card") or {}
         if not card.get("persona"):
             await _retry(message, bot, state,
-                         "<b>🎭 Характер</b>\n\n⚠️ В файле нет описания персонажа. "
-                         "Похоже, это книга лора — грузите её в «📚 Лорбук».")
+                         "<b>🎭 Характер</b>\n\n⚠️ В файле нет описания персонажа.")
             return
-        done = await lore.apply_card(cid, card)
+        done = await cards.apply_card(cid, card)
         note = "✅ Взято из карточки: " + ", ".join(done) + "."
-        if result["entries"]:
-            note += f" Записей лора: {result['entries']}."
         await _finish(message, bot, state, await view_chat(cid), note + "\n\n")
         return
 
@@ -591,106 +612,6 @@ async def names_input(message: Message, state: FSMContext, bot: Bot) -> None:
     if text:
         await db.set_setting(cid, "ai_names", None if text == "-" else text[:300])
     await _finish(message, bot, state, await view_chat(cid))
-
-
-# ---------- лорбук ----------
-
-@router.callback_query(F.data.startswith("m:lore:"))
-async def cb_lore(cb: CallbackQuery, state: FSMContext) -> None:
-    _, _, cid, page = cb.data.split(":")
-    cid = int(cid)
-    if not await _guard(cb, cid):
-        return
-    await state.clear()
-    await _show(cb, await view_lore(cid, int(page)))
-
-
-@router.callback_query(F.data.startswith("m:lored:"))
-async def cb_lore_del(cb: CallbackQuery) -> None:
-    _, _, cid, rid, page = cb.data.split(":")
-    cid = int(cid)
-    if not await _guard(cb, cid):
-        return
-    await db.lore_remove(int(rid))
-    await _show(cb, await view_lore(cid, int(page)), "Удалено")
-
-
-@router.callback_query(F.data.startswith("m:loreclr:"))
-async def cb_lore_clear(cb: CallbackQuery) -> None:
-    cid = int(cb.data.split(":")[2])
-    if not await _guard(cb, cid):
-        return
-    dropped = await db.lore_clear(cid)
-    await _show(cb, await view_lore(cid, 0), f"Удалено записей: {dropped}")
-
-
-@router.callback_query(F.data.startswith("m:loreimp:"))
-async def cb_lore_import(cb: CallbackQuery, state: FSMContext) -> None:
-    cid = int(cb.data.split(":")[2])
-    if not await _guard(cb, cid):
-        return
-    await _ask(
-        cb, state, Input.lore_file,
-        "<b>📥 Загрузка с chub.ai</b>\n\nПришлите файлом:\n"
-        "• <b>лорбук</b> — JSON с записями;\n"
-        "• <b>карточку персонажа</b> — JSON или PNG. Из неё возьму описание "
-        "в «🎭 Характер», имя в «🔔 Имена-обращения» и книгу, если она внутри.\n\n"
-        "Старые записи не удаляются — новые добавятся к ним.",
-        f"m:lore:{cid}:0", cid=cid,
-    )
-
-
-@router.message(StateFilter(Input.lore_file))
-async def lore_file_input(message: Message, state: FSMContext, bot: Bot) -> None:
-    cid = (await state.get_data())["cid"]
-    doc = message.document
-    if doc is None:
-        await _retry(message, bot, state,
-                     "<b>📥 Загрузка</b>\n\n⚠️ Нужен файл: JSON или PNG-карточка.")
-        return
-    if doc.file_size and doc.file_size > 5 * 1024 * 1024:
-        await _retry(message, bot, state,
-                     "<b>📥 Загрузка</b>\n\n⚠️ Файл больше 5 МБ, это точно не лорбук.")
-        return
-    buf = await bot.download(doc.file_id)
-    result = await lore.import_file(cid, buf.read())
-    if result.get("error"):
-        await _retry(message, bot, state, f"<b>📥 Загрузка</b>\n\n⚠️ {result['error']}")
-        return
-    note = [f"✅ Записей добавлено: {result['entries']}."]
-    done = await lore.apply_card(cid, result.get("card") or {})
-    if done:
-        note.append("Из карточки взято: " + ", ".join(done) + ".")
-    await _finish(message, bot, state, await view_lore(cid, 0), " ".join(note) + "\n\n")
-
-
-@router.callback_query(F.data.startswith("m:loreadd:"))
-async def cb_lore_add(cb: CallbackQuery, state: FSMContext) -> None:
-    cid = int(cb.data.split(":")[2])
-    if not await _guard(cb, cid):
-        return
-    await _ask(
-        cb, state, Input.lore_entry,
-        "<b>➕ Запись лорбука</b>\n\nФормат: <code>ключи | текст</code>.\n"
-        "Ключи через запятую — по ним запись просыпается.\n"
-        "Вместо ключей <code>*</code> — запись пойдёт в каждый запрос.",
-        f"m:lore:{cid}:0", cid=cid,
-    )
-
-
-@router.message(StateFilter(Input.lore_entry))
-async def lore_entry_input(message: Message, state: FSMContext, bot: Bot) -> None:
-    cid = (await state.get_data())["cid"]
-    raw = (message.text or "").strip()
-    keys, _, content = raw.partition("|")
-    keys, content = keys.strip(), content.strip()
-    if not content:
-        await _retry(message, bot, state,
-                     "<b>➕ Запись лорбука</b>\n\n⚠️ Нужен формат <code>ключи | текст</code>.")
-        return
-    always = 1 if keys in ("*", "") else 0
-    await db.lore_add(cid, "" if always else keys[:300], content[:1500], always)
-    await _finish(message, bot, state, await view_lore(cid, 0), "✅ Запись добавлена.\n\n")
 
 
 # ---------- доступ ----------

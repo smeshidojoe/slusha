@@ -13,8 +13,11 @@
 История чата живёт в памяти процесса поверх базы: перезапуск её не теряет.
 """
 import asyncio
+import contextlib
+import contextvars
 import difflib
 import logging
+import random
 import re
 import time
 from collections import deque
@@ -164,6 +167,47 @@ def _get_client():
     return _client
 
 
+# Сколько ждём модель. Ответ в чат — AI_TIMEOUT: дольше молчание выглядит
+# поломкой. Пересборку заметок не ждёт никто, а одна она идёт 20–30 с, и в
+# очереди Ollama за ответами трёх ботов переваливала за 40: Слюша 3 октября
+# не собрал заметки 14 раз подряд, с 18:45 до 23:13.
+_wait: contextvars.ContextVar[float | None] = contextvars.ContextVar("ai_wait", default=None)
+
+
+def _timeout() -> float:
+    return _wait.get() or config.AI_TIMEOUT
+
+
+@contextlib.contextmanager
+def patient(seconds: float):
+    """Внутри блока запросы к модели ждут seconds, а не AI_TIMEOUT."""
+    token = _wait.set(seconds)
+    try:
+        yield
+    finally:
+        _wait.reset(token)
+
+
+_collect: contextvars.ContextVar[bool] = contextvars.ContextVar("ai_collect", default=False)
+
+
+@contextlib.contextmanager
+def collecting():
+    """Внутри блока запросы идут к модели сборщика (AI_COLLECT_MODEL).
+
+    Только для Ollama; без настройки блок ничего не меняет.
+    """
+    on = bool(config.AI_COLLECT_MODEL) and mode() == "ollama"
+    token = _collect.set(on)
+    wait = _wait.set(config.AI_COLLECT_TIMEOUT) if on else None
+    try:
+        yield
+    finally:
+        if wait is not None:
+            _wait.reset(wait)
+        _collect.reset(token)
+
+
 # ---------- история ----------
 
 # Как в истории подписаны собственные реплики бота. Под юзернеймом он
@@ -212,15 +256,12 @@ async def remember(chat_id: int, who: str, text: str, msg_id: int | None = None,
     summary.note(chat_id)
 
 
-async def history(chat_id: int, limit: int, thread_id: int | None = None) -> list[Line]:
-    """Хвост переписки. thread_id — оставить только реплики этой темы форума."""
+async def history(chat_id: int, limit: int) -> list[Line]:
+    """Хвост переписки."""
     buf = await _warm(chat_id)
     if not buf:
         return []
-    rows = list(buf)
-    if thread_id is not None:
-        rows = [r for r in rows if r.thread_id == thread_id]
-    return rows[-limit:]
+    return list(buf)[-limit:]
 
 
 async def set_reactions(chat_id: int, msg_id: int, text: str) -> bool:
@@ -313,6 +354,26 @@ def _names(s) -> list[str]:
     """Имена-обращения как их ввели, вместе со звёздочками падежей."""
     raw = (s.ai_names or "").lower()
     return [n.strip() for n in re.split(r"[,\n]", raw) if n.strip()]
+
+
+def strip_self_address(text: str, names) -> str:
+    """Убрать обращение к собеседнику своим же именем.
+
+    «С днём рожденья, таба!» — Яни звала человека своим ником: «таба» стоит в
+    её именах-обращениях, и модель принимает его за словечко чата. Режем
+    только обращение — имя после запятой перед знаком или в начале с запятой;
+    «ну ты и кошка» остаётся.
+    """
+    words = sorted({re.escape(n) for n in names if n and " " not in n and len(n) >= 3},
+                   key=len, reverse=True)
+    if not words or not text:
+        return text
+    alt = "|".join(words)
+    out = re.sub(rf",\s*(?:{alt})(?=\s*(?:[!?.…,)]|$))", "", text, flags=re.IGNORECASE)
+    out = re.sub(rf"^(?:{alt})\s*,\s*", "", out, flags=re.IGNORECASE)
+    if out and out != text and out[0].islower():
+        out = out[0].upper() + out[1:]
+    return out
 
 
 def plain_names(s) -> list[str]:
@@ -413,7 +474,13 @@ async def wanted(bot, message, s) -> bool:
     if await called_by_name(bot, message, s):
         return True
     if await replied_to(bot, message):
-        return getattr(s, "ai_reply", 50) > 0
+        level = getattr(s, "ai_reply", 50)
+        if getattr(message, "sticker", None) is not None and level < 100:
+            # Стикер боту — чаще реакция, чем реплика: «👍», «😂». Судья
+            # картинку не видит, а на «одним смайлом» честно говорит НЕТ.
+            # Отвечаем через раз, иначе обмен стикерами — пинг-понг.
+            return random.random() * 100 < level
+        return level > 0
     return False
 
 
@@ -447,6 +514,8 @@ async def should_reply(bot, message, s) -> bool:
         return False                     # говорил недавно — даём чату пожить
     if not _worth_joining(text, rows):
         return False                     # обрывок чужого диалога — ждём реплику с темой
+    if _personal(message, text):
+        return False                     # «ты» в реплае другому — разговор двоих
     return await _decide(bot, message, s, text, to_bot=False)
 
 
@@ -463,6 +532,26 @@ _LETTERS = re.compile(r"[^\W\d_]+")
 # ответить; короткие по-прежнему решает судья. По логу за четыре дня доля
 # ответов выросла бы с 26% до 43%.
 _REPLY_WORDS = 7
+
+
+_YOU = re.compile(r"\b(ты|тебя|тебе|тобой|твой|твоя|твоё|твое|твои|твоих|твоим)\b",
+                  re.IGNORECASE)
+
+
+def _personal(message, text: str) -> bool:
+    """Реплай другому человеку с обращением на «ты» — это разговор двоих.
+
+    «мне больше интересно, чем ты занимаешься» — реплаем @nDiador. Судья
+    реплай не видит, решил «всему чату», и Коул принял «ты» на себя:
+    «Интереснее, чем твоя жалкая рутина» — «КОУЛ? КАКОГО ХРЕНА?». Таких
+    реплик в чате немного — 6% у Слюши, 4% у Холо, — сам бот в них не лезет.
+    """
+    reply = message.reply_to_message
+    if reply is None or reply.from_user is None or message.from_user is None:
+        return False
+    if reply.from_user.id == message.from_user.id:
+        return False                     # дописал сам себе
+    return bool(_YOU.search(text))
 
 
 def _in_dialog(rows) -> bool:
@@ -626,8 +715,7 @@ async def _decide(bot, message, s, text: str, to_bot: bool) -> bool:
         return False
     _judging.add(chat_id)
     try:
-        thread = thread_of(message) if s.ai_topics else None
-        rows = await history(chat_id, config.AI_JUDGE_CTX, thread)
+        rows = await history(chat_id, config.AI_JUDGE_CTX)
         me = await bot.me()
         yes = await judge(s, chat_id, rows, [me.full_name] + plain_names(s), to_bot)
     finally:
@@ -878,7 +966,7 @@ _ACTION = re.compile(r"\s*\*[^*\n]{1,80}\*")
 
 
 def strip_actions(text: str) -> str:
-    """Убрать вставки вида *Вздыхает*, когда ролеплей выключен.
+    """Убрать вставки вида *Вздыхает*.
 
     В чат ушло «Вареная колбаса... *Мяукает*. Слишком много электромагнитных
     колебаний...» — архимагос Механикус мяукать не должен, а модель ставит
@@ -979,6 +1067,52 @@ _COMMON = {"пожалу", "конечн", "спасиб", "наверн", "во
            "кажетс", "поэтom", "поэтом", "давайт", "нормал", "интере"}
 
 
+# Связки и частые слова: совпадение по ним не значит, что модель взяла
+# чужой ярлык. Сверяем по первым четырём буквам слова от пяти букв.
+_COMMON4 = frozenset("""
+прос толь коне сейч всег нико може очен пото тако этог когд тебя твое твой
+кото ниче поче дава лучш вооб буде нужн можн разв здес тепе посл пере чере
+снов опят совс нель чтоб помн знаю прав спас хоро нрав рабо пыта
+тобо мной собо сказ дума гово хоте знае виде дела люби""".split())
+
+
+def _foreign(rows, asked_by: str):
+    """Реплика бота, на которую отвечает собеседник, — если сказана она другому.
+
+    (текст реплики, кому она была сказана) или None.
+    """
+    if not rows:
+        return None
+    last = rows[-1]
+    if last.who != asked_by or not getattr(last, "reply_to", None):
+        return None
+    by = {ln.msg_id: ln for ln in rows if ln.msg_id}
+    mine = by.get(last.reply_to)
+    if mine is None or mine.who != SELF:
+        return None
+    parent = by.get(mine.reply_to)
+    if parent is None or parent.who in (SELF, asked_by):
+        return None
+    return mine.text, parent.who
+
+
+def _borrowed(text: str, foreign: str, question: str) -> str:
+    """Слово из реплики бота одному человеку, перекочевавшее в ответ другому.
+
+    Коул назвал @Chel0veku «улитёнкой», @katieboots ответила реплаем на это
+    сообщение «Привет, помнишь меня?» — и получила «Да. Улитёнка». Модель
+    видит свою реплику прямо перед новой и продолжает её, как будто
+    собеседник тот же.
+    """
+    def keys(t):
+        return {w.lower()[:4]: w for w in re.findall(r"[^\W\d_]{5,}", t)}
+    theirs, asked = keys(foreign), keys(question)
+    for k, w in keys(text).items():
+        if k in theirs and k not in asked and k not in _COMMON4:
+            return w
+    return ""
+
+
 def hooked(text: str, recent, theirs=()) -> str:
     """Вцепившаяся присказка: своё словцо, которое бот тянет из ответа в ответ.
 
@@ -999,6 +1133,15 @@ def hooked(text: str, recent, theirs=()) -> str:
     words = _norm(text).split()
     if not words:
         return ""
+    # Зачин, которым начинаются уже два прошлых ответа: «Ёпта, пизда!», «Да
+    # ладно тебе». Чужие реплики тут не оправдание: «ёпта пизда» Яни подхватила
+    # у человека из чата и открывала им три ответа из семи, а её спрашивали
+    # «ты чё ахуела мою фразу брать?». Тема живёт в середине ответа, в зачине —
+    # только привычка.
+    head = words[:2]
+    if len(head) == 2 and sum(_norm(old).split()[:2] == head
+                              for old in recent) >= config.AI_PHRASE_HITS:
+        return " ".join(text.split()[:2]).strip(" ,.!?…")
     others = set()
     for line in theirs:
         others.update(_stems(line))
@@ -1305,23 +1448,32 @@ async def ask(s, chat_title: str | None, chat_id: int, asked_by: str,
     tail = Line(asked_by, question[:LINE_MAX])
     if not rows or (rows[-1].who, rows[-1].text) != (tail.who, tail.text):
         rows.append(tail)
+    # Событие из прошлых разговоров, близкое к реплике по смыслу (memory.py), —
+    # в сам вопрос, как описание стикера. Строкой в задании Коул его почти не
+    # замечал: на четырёх вопросах по три ответа прошлое всплыло в 1 из 12,
+    # в вопросе — в 6: «Пропуск? Снова? Похоже, у тебя память как у мотылька».
+    plain = question
+    if getattr(s, "ai_journal", 1):
+        from . import memory
+        if memory.enabled():
+            from . import history as store
+            everyone = await store.people_all(chat_id)
+            pool = [p for _, d in everyone for p in d.split("; ")]
+            past = await memory.remembered(chat_id, question, pool)
+            if past:
+                question = f"{question} [{past}]"
+                rows[-1] = rows[-1]._replace(text=question[:LINE_MAX])
 
     system = _prompt(s, chat_title, asked_by, self_names)
-    from . import lore, summary
+    from . import summary
     # заметки о чате из прошлых разговоров — и записи только о тех людях,
-    # кто сейчас в разговоре: память о всех сразу в промпт не влезет
+    # кто сейчас в разговоре: память о всех сразу в промпт не влезет.
+    # Договорённости и шутки — подходящие к последним репликам.
+    talk = "\n".join(ln.text for ln in rows[-config.MEM_NOTES_TALK:])
     notes = await summary.block(
-        chat_id, summary.present(rows, asked_by, branch, self_names or ()))
+        chat_id, summary.present(rows, asked_by, branch, self_names or ()), talk)
     if notes:
         system += "\n\n" + notes
-    # лорбук будим по тексту самой переписки, а не по всему промпту
-    body = "\n".join(f"{ln.who}: {ln.text}" for ln in rows)
-    # Выключатель на весь чат. Гасить записи поодиночке негде: их полторы
-    # сотни, и вернуть потом всё как было уже не выйдет.
-    known = (await lore.block(chat_id, body, background=bool(s.ai_lore_bg))
-             if getattr(s, "ai_lore", 1) else "")
-    if known:
-        system += "\n\n" + known
 
     shots = examples(s)
     messages = turns(rows, shots)
@@ -1338,6 +1490,23 @@ async def ask(s, chat_title: str | None, chat_id: int, asked_by: str,
         task.append(reply_note)
     if images:
         task.append("К сообщению приложена картинка — посмотри на неё.")
+    # Что помним о собеседнике по теме его реплики, и его созревший план —
+    # «вчера писал: завтра сдавать чертежи», чтобы спросить, как прошло.
+    known = await summary.recall(chat_id, asked_by, plain, self_names or ())
+    if known:
+        task.append(known)
+    if getattr(s, "ai_plans", 1):
+        from . import plans
+        later = await plans.line(chat_id, asked_by, rows)
+        if later:
+            task.append(later)
+    # Как этот человек обращается с ботом. Без этой строки тон задаёт
+    # переписка: после чужой перепалки бот огрызался и на вежливый вопрос.
+    if getattr(s, "ai_mood", 1):
+        from . import mood
+        how = await mood.line(chat_id, asked_by)
+        if how:
+            task.append(how)
     # Реплику называем дословно, хотя она уже стоит последней строкой
     # переписки. Повтор тут не лишний: в промпте полсотни строк чата, и одна
     # короткая реплика среди них тонет — бот отвечал не собеседнику, а тому,
@@ -1371,11 +1540,15 @@ async def ask(s, chat_title: str | None, chat_id: int, asked_by: str,
         text = await _clean(await raw(system, messages, limit, images), s,
                             voices, asked, chat_title or "")
         stuck = hooked(text, said, theirs) if text else ""
-        if text and (repeats(text, said) or stuck):
+        # отвечают на реплику бота другому человеку — её слова этому не годятся
+        foreign = _foreign(rows, asked_by)
+        borrowed = _borrowed(text, foreign[0], question) if text and foreign else ""
+        if text and (repeats(text, said) or stuck or borrowed):
             # Не ругаемся и не молчим сразу: показываем модели её же ответ и
             # просим другой. Обычно второй попытки хватает.
             logger.info("ai: чат %s, %s — переспрашиваю", chat_id,
-                        f"вцепилась присказка «{stuck}»" if stuck
+                        f"слово «{borrowed}» из реплики для {foreign[1]}" if borrowed
+                        else f"вцепилась присказка «{stuck}»" if stuck
                         else "ответ повторяет прошлый")
             # Присказку называем дословно: «ответь иначе» модель понимает
             # как «те же слова другим порядком» и присказку тащит дальше.
@@ -1385,13 +1558,19 @@ async def ask(s, chat_title: str | None, chat_id: int, asked_by: str,
                 ask_again = (f"Ты повторяешься: фраза «{stuck}» у тебя уже была. "
                              "Ответь на ту же реплику, но без неё и без того, "
                              "что вокруг неё, — другой мыслью.")
+            if borrowed:
+                ask_again = (f"«{borrowed}» ты говорил {foreign[1]}, а пишет тебе "
+                             f"{asked_by} — другой человек. Ответь {asked_by} "
+                             "заново, своими словами.")
             again = messages + [
                 {"role": "assistant", "content": text},
                 {"role": "user", "content": ask_again},
             ]
             second = await _clean(await raw(system, again, limit, images), s,
                                   voices, asked, chat_title or "")
-            if second and not repeats(second, said + [text]) and not hooked(second, said, theirs):
+            if (second and not repeats(second, said + [text])
+                    and not hooked(second, said, theirs)
+                    and not (foreign and _borrowed(second, foreign[0], question))):
                 text = second
             elif second and not repeats(second, said + [text], config.AI_REPEAT_HARD):
                 # Со второй попытки вышло похоже, но не слово в слово. Молчать
@@ -1401,7 +1580,7 @@ async def ask(s, chat_title: str | None, chat_id: int, asked_by: str,
                 logger.info("ai: чат %s, вторая попытка похожа, но не дословна — "
                             "отвечаю ей", chat_id)
                 text = second
-            elif stuck and not repeats(text, said):
+            elif (stuck or borrowed) and not repeats(text, said):
                 # Сработала только защита от присказки, а сам ответ
                 # повтором не был. Молчать из-за вцепившегося оборота
                 # нельзя: в живом чате бот так пропустил подряд несколько
@@ -1458,19 +1637,28 @@ async def _clean(text: str, s, self_names: list | None,
     text = _step("мысли", text or "", strip_thoughts(text or "").strip())
     text = _step("подпись", text, strip_bot_prefix(text, self_names))
     text = _step("указание", text, strip_orders(text))
-    if not getattr(s, "ai_roleplay", 0):
-        text = _step("звёздочки", text, strip_actions(text))
+    text = _step("звёздочки", text, strip_actions(text))
     text = _step("кавычки", text, strip_quotes(text))
+    text = _step("своё имя", text, strip_self_address(text, plain_names(s)))
     text = _step("эхо вопроса", text, strip_echo(text, question))
     # название чата тоже утекает из системного промпта
     return _step("эхо чата", text, strip_echo(text, chat_title, need_sep=True))
+
+
+def _mime(data: str) -> str:
+    """Тип картинки по первым байтам base64: фото — jpeg, стикеры — webp."""
+    if data.startswith("UklGR"):
+        return "image/webp"
+    if data.startswith("iVBOR"):
+        return "image/png"
+    return "image/jpeg"
 
 
 def _anthropic_content(question: str, images: list[str] | None) -> list | str:
     if not images:
         return question
     blocks = [{"type": "image",
-               "source": {"type": "base64", "media_type": "image/jpeg", "data": data}}
+               "source": {"type": "base64", "media_type": _mime(data), "data": data}}
               for data in images]
     blocks.append({"type": "text", "text": question})
     return blocks
@@ -1497,7 +1685,7 @@ async def _ask_anthropic(system: str, messages: list[dict], tokens: int,
         msg["content"] = _anthropic_content(msg["content"], imgs)
         return msg
 
-    resp = await _get_client().messages.create(
+    resp = await _get_client().with_options(timeout=_timeout()).messages.create(
         model=config.AI_MODEL,
         max_tokens=tokens,
         system=system,
@@ -1522,7 +1710,7 @@ async def _ask_openai(system: str, messages: list[dict], tokens: int,
 
     def attach(msg, imgs):
         content = [{"type": "image_url",
-                    "image_url": {"url": f"data:image/jpeg;base64,{data}"}}
+                    "image_url": {"url": f"data:{_mime(data)};base64,{data}"}}
                    for data in imgs]
         content.append({"type": "text", "text": msg["content"]})
         msg["content"] = content
@@ -1538,7 +1726,7 @@ async def _ask_openai(system: str, messages: list[dict], tokens: int,
     }
     if hush:
         body["think"] = False        # то же самое, но для свежих версий Ollama
-    resp = await _get_client().post("/chat/completions", json=body)
+    resp = await _get_client().post("/chat/completions", json=body, timeout=_timeout())
     if resp.status_code >= 400:
         logger.warning("ai: %s ответил %s: %s", config.AI_BASE_URL,
                        resp.status_code, resp.text[:200])
@@ -1637,21 +1825,26 @@ async def _ask_ollama(system: str, messages: list[dict], tokens: int,
         msg["images"] = imgs
         return msg
 
+    collect = _collect.get()
     body = {
-        "model": config.AI_MODEL,
+        "model": config.AI_COLLECT_MODEL if collect else config.AI_MODEL,
         "stream": False,
         "messages": [{"role": "system", "content": system}]
                     + _with_images(talk, images, attach),
         "options": {
             "temperature": config.AI_TEMPERATURE,
             "num_predict": tokens,
-            "num_ctx": await _model_ctx(),         # иначе Ollama режет промпт
+            # иначе Ollama режет промпт
+            "num_ctx": config.AI_COLLECT_CTX if collect else await _model_ctx(),
             "repeat_penalty": config.AI_REPEAT_PENALTY,
         },
     }
+    if collect and config.AI_COLLECT_CPU:
+        body["options"]["num_gpu"] = 0
+        body["options"]["num_thread"] = config.AI_COLLECT_THREADS
     if hush:
         body["think"] = False
-    resp = await _get_client().post("/api/chat", json=body)
+    resp = await _get_client().post("/api/chat", json=body, timeout=_timeout())
     if resp.status_code >= 400 and "think" in body:
         # старые сборки Ollama этого поля не знают и отвечают ошибкой
         # Тогда и достаём текстовую пометку: без неё думающая модель уйдёт
@@ -1661,7 +1854,7 @@ async def _ask_ollama(system: str, messages: list[dict], tokens: int,
         body.pop("think")
         body["messages"][0]["content"] += "\n/no_think"
         body["messages"][-1]["content"] += "\n/no_think"
-        resp = await _get_client().post("/api/chat", json=body)
+        resp = await _get_client().post("/api/chat", json=body, timeout=_timeout())
     if resp.status_code >= 400:
         logger.warning("ai: ollama ответила %s: %s", resp.status_code, resp.text[:200])
         return ""
@@ -1683,13 +1876,26 @@ async def _reply_note(bot, message, who: str, seen=None) -> str | None:
     reply = message.reply_to_message
     if reply is None:
         return None
+    quoted = (reply.text or reply.caption or "").strip()[:400]
+    if not quoted:
+        quoted = ("медиа без подписи" if getattr(reply, "sticker", None) is None
+                  else attachment_label(reply))
+    me = await bot.me()
+    if reply.from_user and reply.from_user.id == me.id:
+        # Ответ на реплику бота, сказанную другому. Без ноты модель видит
+        # свою реплику прямо перед новой и продолжает разговор с тем, кому
+        # отвечала: @katieboots на «Привет, помнишь меня?» получила
+        # «Улитёнка» — ярлык, которым бот только что назвал @Chel0veku. На
+        # 15 повторах перенос ярлыка с нотой — 1 раз, без неё — 2.
+        by = {getattr(ln, "msg_id", None): ln for ln in (seen or ())}
+        said = by.get(getattr(reply, "message_id", None))
+        parent = by.get(getattr(said, "reply_to", None)) if said else None
+        if parent is not None and parent.who not in (SELF, who):
+            return (f"{who} отвечает на твою реплику, сказанную {parent.who}: "
+                    f"«{quoted}». Пишет тебе {who}, а не {parent.who}.")
     last = seen[-1] if seen else None
     if last is not None and getattr(last, "msg_id", None) == reply.message_id:
         return None
-    quoted = (reply.text or reply.caption or "").strip()[:400]
-    if not quoted:
-        quoted = "медиа без подписи"
-    me = await bot.me()
     if reply.from_user and reply.from_user.id == me.id:
         return f"{who} отвечает на твоё сообщение: «{quoted}»."
     author = "неизвестно кого"
@@ -1697,6 +1903,82 @@ async def _reply_note(bot, message, who: str, seen=None) -> str | None:
         author = ((reply.from_user.username and f"@{reply.from_user.username}")
                   or reply.from_user.full_name)
     return f"{who} отвечает на сообщение {author}: «{quoted}»."
+
+# Стикер боту — описание словами, а не картинка в ответ. Картинка в конце
+# длинного промпта у gemma3:4b тонула: на 8 стикеров Коул сослался на
+# стикер один раз и продолжал свою прошлую реплику. С описанием в метке
+# («[стикер 😘: два розовых фрукта, поцелуй]») — в пяти: «Политика любви —
+# всегда дефектный алгоритм». Наборы в чате одни и те же, поэтому описание
+# запоминаем по file_unique_id.
+_SEE_STICKER = ("Это стикер из Telegram. Опиши его в 3–6 словах: кто или что на "
+                "нём и какая эмоция. Если на нём есть надпись — приведи её. "
+                "Только описание.")
+_SEEN_MAX = 500
+_seen_stickers: dict[str, str] = {}
+# «Стикер с волком» режем только до «с»: без предлога остаётся «волком»
+_SEEN_LEAD = re.compile(r"^(на (этом )?стикере|стикер|на картинке)\s*"
+                        r"(изображ\w+\s*)?", re.IGNORECASE)
+_NO_BRACKETS = str.maketrans("[]", "()")
+
+
+async def sticker_seen(bot, message) -> str:
+    """Что на стикере, в нескольких словах. Пусто — не разглядели."""
+    from . import vision
+    st = message.sticker
+    key = getattr(st, "file_unique_id", None)
+    if key and key in _seen_stickers:
+        return _seen_stickers[key]
+    data = await vision.sticker(bot, message)
+    if not data:
+        return ""
+    try:
+        out = await raw("Ты коротко описываешь картинки.", _SEE_STICKER,
+                        config.AI_JUDGE_TOKENS + 40, [data])
+    except Exception:
+        logger.warning("ai: не описать стикер", exc_info=True)
+        return ""
+    out = re.sub(r"\s+", " ", strip_thoughts(out or "")).strip(" .«»\"")
+    # скобки сломали бы метку: сборщик заметок узнаёт голое вложение по ним
+    out = _SEEN_LEAD.sub("", out.translate(_NO_BRACKETS))[:80].strip(" .,")
+    if out.count('"') % 2:
+        out += '"'                       # «показывает "окей» — кавычку закрываем
+    if key and out:
+        if len(_seen_stickers) >= _SEEN_MAX:
+            _seen_stickers.pop(next(iter(_seen_stickers)))
+        _seen_stickers[key] = out
+    return out
+
+
+_SEE_PHOTO = ("Опиши картинку одним-двумя предложениями: что на ней и главные "
+              "надписи, если есть.")
+
+
+async def photo_seen(data: str) -> str:
+    """Что на фото, в одном-двух предложениях. Пусто — не разглядели."""
+    try:
+        out = await raw("Ты коротко описываешь картинки.", _SEE_PHOTO, 90, [data])
+    except Exception:
+        logger.warning("ai: не описать фото", exc_info=True)
+        return ""
+    out = re.sub(r"\s+", " ", strip_thoughts(out or "")).strip(" «»\"")
+    out = _SEEN_LEAD.sub("", out.translate(_NO_BRACKETS))
+    out = re.sub(r"^На (этой )?картинке (изображен\w*|отображ\w*|видн\w*|представлен\w*)\s*",
+                 "", out, flags=re.IGNORECASE)
+    return out[:300].strip(" .,")
+
+
+# Снимок берут после судьи, а судья думает секунды: за это время в чат
+# успевают прийти новые реплики. Коул ответил на «Дипстейт распыляет химикаты»
+# словами «Хихикает, да?» — из соседней реплики, — пока следом пришёл стикер.
+# Повтор того места: со стикером после цели 3 пустых ответа из 8 и ни одного
+# про химикаты; снимок по цель — 0 пустых и 4 из 8 про химикаты.
+def upto(rows, msg_id):
+    """Переписка по реплику msg_id включительно; нет её в снимке — вся."""
+    for i in range(len(rows) - 1, -1, -1):
+        if rows[i].msg_id == msg_id:
+            return rows[:i + 1]
+    return rows
+
 
 async def maybe_reply(bot, message, s) -> None:
     """Точка входа из конвейера: решить, ответить и записать в историю."""
@@ -1710,21 +1992,40 @@ async def maybe_reply(bot, message, s) -> None:
     thread = thread_of(message)
 
     if not text:
-        # голое вложение: запоминаем, чтобы не было дыры в разговоре
         label = attachment_label(message)
+        # фото или стикер без подписи в ответ боту — это тоже обращение, но
+        # ответить на него есть чем только со зрением: иначе бот рассуждал бы
+        # о картинке, которой не видел
+        sticker = vision.has_sticker(message)
+        go = (s.ai_on and s.ai_vision and available()
+              and (vision.has_photo(message) or sticker)
+              and user is not None and not user.is_bot
+              and (not sticker or _ready(chat_id))
+              and await wanted(bot, message, s))
+        if go and sticker:
+            seen = await sticker_seen(bot, message)
+            if seen:
+                label = f"{label[:-1]}: {seen}]"
+            else:
+                go = False               # не разглядели — молчим, а не гадаем
+        # голое вложение запоминаем, чтобы не было дыры в разговоре; стикер —
+        # уже с описанием, оно пригодится и следующим ответам
         if label:
             await remember(chat_id, who, label, message.message_id, reply_to, thread)
-        # фото без подписи в ответ боту — это тоже обращение, но ответить на
-        # него есть чем только со зрением: иначе бот рассуждал бы о картинке,
-        # которой не видел
-        if not (s.ai_on and s.ai_vision and available()
-                and vision.has_photo(message)
-                and user is not None and not user.is_bot
-                and await wanted(bot, message, s)):
+        if not go:
             return
         text = label or "[фото]"
     else:
         await remember(chat_id, who, text, message.message_id, reply_to, thread)
+        # тон считаем по всем обращениям к боту, а не только по тем, на
+        # которые он ответил: грубиян, оставшийся без ответа, всё равно грубиян
+        if user is not None and not user.is_bot:
+            if await addressed(bot, message, s):
+                from . import mood
+                await mood.note(chat_id, who, text)
+            # планы ловим во всех репликах: «завтра собес» говорят не боту
+            from . import plans
+            await plans.note(chat_id, who, text)
         if not await should_reply(bot, message, s):
             return
 
@@ -1734,7 +2035,7 @@ async def maybe_reply(bot, message, s) -> None:
         return
     _last_reply[chat_id] = time.time()
     # снимок переписки берём сейчас, пока она соответствует поводу ответить
-    snapshot = await history(chat_id, s.ai_ctx, thread if s.ai_topics else None)
+    snapshot = upto(await history(chat_id, s.ai_ctx), message.message_id)
     note = await _reply_note(bot, message, who, snapshot)
     branch = chain(await history(chat_id, config.AI_HISTORY), reply_to)
     # Отвечают на реплику самого бота — ветку не показываем, хватит ноты.
@@ -1745,12 +2046,43 @@ async def maybe_reply(bot, message, s) -> None:
     # без ветки — 0 из 8.
     if branch and branch[-1].who == SELF:
         branch = None
+    # Вопрос текстом на стикер: «коул, что на этом стикере?». Картинкой в конце
+    # задания gemma3:4b стикер почти не замечала: на шести живых вопросах Коул
+    # назвал, что на нём, в 1–2 ответах из 12 («Секрет.»). С описанием прямо в
+    # вопросе — в 9 из 12, а картинка вдобавок к описанию только сбивала: 6.
+    # В историю описание не пишем: сборщик заметок принял бы его за факт.
+    described = False
+    if (s.ai_vision and reply is not None and vision.has_sticker(reply)
+            and not vision.has_photo(message)):
+        seen = await sticker_seen(bot, reply)
+        if seen:
+            label = attachment_label(reply)
+            asked = f"{text} [в ответ на {label[1:-1]}: {seen}]"
+            snapshot = [ln._replace(text=asked[:LINE_MAX])
+                        if ln.msg_id == message.message_id else ln for ln in snapshot]
+            text, described = asked, True
     images = []
-    if s.ai_vision:
+    if s.ai_vision and not described:
         try:
             images = await vision.grab(bot, message)
         except Exception:
             logger.warning("не собрать картинки в чате %s", chat_id, exc_info=True)
+    # Фото — ещё и словами, в сам вопрос; картинка остаётся. На скриншот с
+    # подписью «вот такая штука, весьма удобная» Коул отвечал «Просто покажи,
+    # как она выглядит» — картинку в конце задания gemma3:4b не замечала. На
+    # шести фото с подписью: «покажи» без описания — в 3 ответах из 12, с
+    # описанием и картинкой — в 1, и ответы про то, что на фото: «Скелет —
+    # грубая модель», «Добавь грибы».
+    if images and not (reply is not None and not vision.has_photo(message)
+                       and vision.has_sticker(reply)):
+        seen = await photo_seen(images[0])
+        if seen:
+            where = "на фото" if vision.has_photo(message) else "в ответ на фото"
+            asked = (f"[фото: {seen}]" if text == "[фото]"
+                     else f"{text} [{where}: {seen}]")
+            snapshot = [ln._replace(text=asked[:LINE_MAX])
+                        if ln.msg_id == message.message_id else ln for ln in snapshot]
+            text = asked
     # Голое фото, которое так и не скачалось. Без пометки модель видит только
     # «[фото]» и гадает вслепую, а молчание на прямое обращение выглядит
     # поломкой. Пусть признается, что не видит, — в своём характере.
@@ -1761,6 +2093,47 @@ async def maybe_reply(bot, message, s) -> None:
         note = f"{note}\n{_BLIND}" if note else _BLIND
     asyncio.create_task(_respond(bot, message, s, who, text, snapshot, note,
                                  branch, images, thread, blind))
+
+
+async def _search_for(bot, message, s, text: str, extra: dict) -> tuple[str, str | None, str]:
+    """Просьба показать или найти: (строка в задание, путь к картинке, что на ней)."""
+    from . import search
+    reply = message.reply_to_message
+    me = await bot.me()
+    bot_line = ""
+    if reply is not None and reply.from_user is not None and reply.from_user.id == me.id:
+        bot_line = reply.text or reply.caption or ""
+    kind, query = await search.intent(text, bot_line)
+    if not kind:
+        return "", None, ""
+    chat_id = message.chat.id
+    if kind == "info":
+        found = await search.facts(chat_id, query)
+        if not found:
+            return (f"Ты поискал в интернете «{query}», но ничего толкового не нашлось. "
+                    "Скажи об этом коротко, в своём характере."), None, ""
+        # справка — третьим полем, без картинки: она пойдёт в сам вопрос
+        return "", None, found
+    try:
+        await bot.send_chat_action(chat_id, "upload_photo", **extra)
+    except Exception:
+        pass
+    got = await search.picture(chat_id, query)
+    if got is None:
+        return (f"Ты поискал в интернете картинку «{query}», но подходящей не нашлось. "
+                "Скажи об этом коротко, в своём характере."), None, ""
+    path, seen = got
+    if kind == "self":
+        # Своё описание модель сочиняет: обложку с Яни назвала «монстр Хаос».
+        # Кто на портрете, она и так знает — подпись идёт о себе.
+        return ("Ты выполняешь просьбу: отправляешь в чат свой портрет. Твой ответ — "
+                "подпись к нему: покажи его собеседнику и скажи пару слов о себе."), path, "твой портрет"
+    # «Сейчас она уйдёт в чат, а твой ответ станет подписью» — и Коул в 7
+    # подписях из 10 сам просил прислать картинку: «Приклейте изображение».
+    # Когда сказано, что он выполняет просьбу и показывает, — в 1 из 10.
+    what = "своё изображение" if kind == "self" else "найденную картинку"
+    return (f"Ты выполняешь просьбу: отправляешь в чат {what} — {seen}. Твой ответ — "
+            "подпись к ней: покажи её собеседнику и скажи о ней пару слов от себя."), path, seen
 
 
 async def _respond(bot, message, s, who: str, text: str,
@@ -1779,11 +2152,33 @@ async def _respond(bot, message, s, who: str, text: str,
     myname = (me.username and f"@{me.username}") or me.full_name
     # чем бот отзывается: юзернейм, его имя и слова из «Имена-обращения»
     self_names = [me.full_name] + plain_names(s)
+    # «скинь фото с бутылкой пива» — найти картинку или справку до ответа
+    photo, seen = None, ""
+    from . import search
+    if search.enabled(s) and search.wanted(text) and not images:
+        try:
+            line, photo, seen = await _search_for(bot, message, s, text, extra)
+        except Exception:
+            logger.warning("поиск: сорвался в чате %s", chat_id, exc_info=True)
+            line = ""
+        if line:
+            note = f"{note}\n{line}" if note else line
+        elif seen and not photo:
+            # Справку — в сам вопрос, как описание стикера. В задании персонаж
+            # её пропускал: на четырёх вопросах по три ответа факт звучал в 7
+            # из 12, в вопросе — в 10 из 12. В историю её не пишем.
+            asked = f"{text} [нашёл в интернете: {seen}]"
+            if snapshot:
+                snapshot = [ln._replace(text=asked[:LINE_MAX])
+                            if ln.msg_id == message.message_id else ln for ln in snapshot]
+            text, seen = asked, ""
     parts = await ask(s, message.chat.title, chat_id, who, text, self_names,
                       snapshot=snapshot, reply_note=note, branch=branch,
                       images=images)
     if not parts and blind and config.AI_BLIND_REPLY:
         parts = [config.AI_BLIND_REPLY]     # модель промолчала, а звали же
+    if not parts and photo:
+        parts = [""]                        # картинку нашли — шлём и без подписи
     if not parts:
         return
     await _count(chat_id)
@@ -1797,10 +2192,20 @@ async def _respond(bot, message, s, who: str, text: str,
             except Exception:
                 pass
         try:
-            # отвечаем реплаем только на первую часть: остальные идут следом
-            sent = await bot.send_message(
-                chat_id, utils.esc(part), **extra,
-                reply_to_message_id=message.message_id if not i else None)
+            if photo and not i:
+                # найденная картинка, первая часть ответа — подпись к ней
+                from aiogram.types import FSInputFile
+                # «Вот: [картинка розового аксолотля]» — картинка и так рядом
+                part = re.sub(r"\s*\[[^\]]*\]", "", part).strip()
+                sent = await bot.send_photo(
+                    chat_id, FSInputFile(photo), caption=utils.esc(part)[:1000], **extra,
+                    reply_to_message_id=message.message_id)
+                part = f"[фото: {seen}] {part}"
+            else:
+                # отвечаем реплаем только на первую часть: остальные идут следом
+                sent = await bot.send_message(
+                    chat_id, utils.esc(part), **extra,
+                    reply_to_message_id=message.message_id if not i else None)
         except Exception as e:
             if not utils.msg_gone(e):
                 logger.warning("ai: не отправить ответ в %s", chat_id, exc_info=True)

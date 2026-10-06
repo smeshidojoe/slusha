@@ -56,8 +56,6 @@ textarea, input[type=text] {
 textarea { min-height: 120px; }
 
 .pill { background: var(--bg); border-radius: 8px; padding: 2px 8px; font-size: 13px; }
-.lore-item { border-top: 1px solid rgba(139,154,168,.25); padding-top: 8px; margin-top: 8px; }
-.lore-item:first-child { border-top: 0; margin-top: 0; padding-top: 0; }
 .keys { font-weight: 600; }
 .err { color: var(--danger); }
 .ok { color: #4caf50; }

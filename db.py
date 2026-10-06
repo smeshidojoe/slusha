@@ -1,4 +1,4 @@
-"""База бота-собеседника: чаты, настройки разума, лорбук, доступ.
+"""База бота-собеседника: чаты, настройки разума, доступ.
 
 Своя SQLite, не общая с модератором: боты живут в разных процессах, а две
 записи в один файл — это блокировки и «database is locked» на ровном месте.
@@ -38,23 +38,13 @@ CREATE TABLE IF NOT EXISTS settings(
     ai_reply    INTEGER NOT NULL DEFAULT 50,
     ai_lang     INTEGER NOT NULL DEFAULT 1,
     ai_vision   INTEGER NOT NULL DEFAULT 0,
-    ai_topics   INTEGER NOT NULL DEFAULT 0,
     ai_greeting TEXT,
     ai_examples TEXT,
-    ai_lore_bg  INTEGER NOT NULL DEFAULT 1,
-    ai_lore     INTEGER NOT NULL DEFAULT 1,
-    ai_roleplay INTEGER NOT NULL DEFAULT 0
+    ai_mood     INTEGER NOT NULL DEFAULT 1,
+    ai_plans    INTEGER NOT NULL DEFAULT 1,
+    ai_search   INTEGER NOT NULL DEFAULT 1,
+    ai_journal  INTEGER NOT NULL DEFAULT 1
 );
-CREATE TABLE IF NOT EXISTS lore(
-    id       INTEGER PRIMARY KEY AUTOINCREMENT,
-    chat_id  INTEGER NOT NULL,
-    keys     TEXT,
-    content  TEXT NOT NULL,
-    always   INTEGER NOT NULL DEFAULT 0,
-    prio     INTEGER NOT NULL DEFAULT 100,
-    enabled  INTEGER NOT NULL DEFAULT 1
-);
-CREATE INDEX IF NOT EXISTS idx_lore_chat ON lore(chat_id);
 CREATE TABLE IF NOT EXISTS access(
     id       INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id  INTEGER,
@@ -88,15 +78,16 @@ class Settings:
     ai_reply: int = 50
     ai_lang: int = 1
     ai_vision: int = 0
-    ai_topics: int = 0
     ai_greeting: str | None = None
     ai_examples: str | None = None
-    ai_lore_bg: int = 1
-    # книга мира целиком: выключатель, а не правка каждой записи
-    ai_lore: int = 1
-    # вставки в звёздочках: *Вздыхает*. По умолчанию режем — модель ставит
-    # их сама примерно в половине ответов, и персонажу они чаще не идут.
-    ai_roleplay: int = 0
+    # говорить с каждым по тому, как он обращается с ботом (mood.py)
+    ai_mood: int = 1
+    # спрашивать, как прошло то, что человек собирался сделать (plans.py)
+    ai_plans: int = 1
+    # искать картинки и справки в интернете (search.py)
+    ai_search: int = 1
+    # копить события из жизни участников и вспоминать их к месту (memory.py)
+    ai_journal: int = 1
 
 
 _FIELDS = {f.name for f in fields(Settings)} - {"chat_id"}
@@ -141,12 +132,12 @@ async def _migrate() -> None:
     for name, decl in (("ai_reply", "INTEGER NOT NULL DEFAULT 50"),
                        ("ai_lang", "INTEGER NOT NULL DEFAULT 1"),
                        ("ai_vision", "INTEGER NOT NULL DEFAULT 0"),
-                       ("ai_topics", "INTEGER NOT NULL DEFAULT 0"),
                        ("ai_greeting", "TEXT"),
                        ("ai_examples", "TEXT"),
-                       ("ai_lore_bg", "INTEGER NOT NULL DEFAULT 1"),
-                       ("ai_lore", "INTEGER NOT NULL DEFAULT 1"),
-                       ("ai_roleplay", "INTEGER NOT NULL DEFAULT 0")):
+                       ("ai_mood", "INTEGER NOT NULL DEFAULT 1"),
+                       ("ai_plans", "INTEGER NOT NULL DEFAULT 1"),
+                       ("ai_search", "INTEGER NOT NULL DEFAULT 1"),
+                       ("ai_journal", "INTEGER NOT NULL DEFAULT 1")):
         await _add_column("settings", name, decl)
     await _db.commit()
 
@@ -240,43 +231,6 @@ async def set_setting(chat_id: int, field: str, value) -> None:
         raise ValueError(f"unknown settings field: {field}")
     await _db.execute(f"UPDATE settings SET {field} = ? WHERE chat_id = ?", (value, chat_id))
     await _db.commit()
-
-
-# ---------- лорбук ----------
-
-async def lore_add(chat_id: int, keys: str, content: str, always: int = 0,
-                   prio: int = 100, enabled: int = 1) -> int:
-    cur = await _db.execute(
-        """INSERT INTO lore (chat_id, keys, content, always, prio, enabled)
-           VALUES (?,?,?,?,?,?)""",
-        (chat_id, keys, content, always, prio, enabled),
-    )
-    await _db.commit()
-    return cur.lastrowid
-
-
-async def lore_list(chat_id: int, only_enabled: bool = False) -> list[aiosqlite.Row]:
-    q = "SELECT * FROM lore WHERE chat_id = ?"
-    if only_enabled:
-        q += " AND enabled = 1"
-    cur = await _db.execute(q + " ORDER BY prio, id", (chat_id,))
-    return await cur.fetchall()
-
-
-async def lore_remove(row_id: int) -> None:
-    await _db.execute("DELETE FROM lore WHERE id = ?", (row_id,))
-    await _db.commit()
-
-
-async def lore_clear(chat_id: int) -> int:
-    cur = await _db.execute("DELETE FROM lore WHERE chat_id = ?", (chat_id,))
-    await _db.commit()
-    return cur.rowcount or 0
-
-
-async def lore_count(chat_id: int) -> int:
-    cur = await _db.execute("SELECT COUNT(*) AS c FROM lore WHERE chat_id = ?", (chat_id,))
-    return (await cur.fetchone())["c"]
 
 
 # ---------- люди и доступ ----------

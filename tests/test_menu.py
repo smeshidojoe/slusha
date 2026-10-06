@@ -175,26 +175,6 @@ async def main():
     check("минус возвращает характер по умолчанию",
           (await db.get_settings(CID)).ai_persona is None)
 
-    # --- лорбук ---
-    await menu.cb_lore_add(FakeCallback(f"m:loreadd:{CID}"), state)
-    await menu.lore_entry_input(FakeMessage("пиво, бар | В баре наливают тёмное."),
-                                state, bot)
-    rows = await db.lore_list(CID)
-    check("запись лора добавилась", len(rows) == 1 and rows[0]["keys"] == "пиво, бар")
-
-    await menu.cb_lore_add(FakeCallback(f"m:loreadd:{CID}"), state)
-    bad = FakeMessage("без разделителя")
-    await menu.lore_entry_input(bad, state, bot)
-    check("кривой формат не добавляет запись", len(await db.lore_list(CID)) == 1)
-    check("и оставляет ввод открытым", await state.get_state() == menu.Input.lore_entry)
-    await state.clear()
-
-    await menu.cb_lore_del(FakeCallback(f"m:lored:{CID}:{rows[0]['id']}:0"))
-    check("запись удалилась", await db.lore_count(CID) == 0)
-    await db.lore_add(CID, "*", "Мир суров.", 1)
-    await menu.cb_lore_clear(FakeCallback(f"m:loreclr:{CID}"))
-    check("книга чистится целиком", await db.lore_count(CID) == 0)
-
     # --- заметки ---
     from slusha import history as store
     await store.summary_set(CID, "Вася любит пиво.", 5)

@@ -155,17 +155,27 @@ def present(rows, asked_by: str = "", branch=(), self_names=()) -> list[str]:
     return out
 
 
-async def block(chat_id: int, people=()) -> str:
+async def block(chat_id: int, people=(), talk: str = "") -> str:
     """Кусок системного промпта с заметками. Пусто — заметок ещё нет.
 
     people — кто сейчас в разговоре (см. present): о них достаём записи.
     Сколько человек брать — AI_PROMPT_PEOPLE: каждый до PERSON_CHARS знаков,
     а длинный промпт маленькая модель держит хуже, персонаж плывёт.
+    talk — хвост переписки: по нему из долгой памяти подбираются
+    договорённости и шутки (memory.notes_for).
     """
-    from . import ai, history as store
+    from . import ai, history as store, memory
     try:
         text = await _general(chat_id)
         known = await store.people_get(chat_id, list(people))
+        if memory.notes_on():
+            picked = await memory.notes_for(chat_id, talk) if talk.strip() else []
+            text = _fill(text, {k: [r["text"] for r in picked if r["kind"] == k]
+                                for k in memory.NOTE_KINDS.values()})
+        elif kept := await memory.notes_all(chat_id):
+            # память заметок выключили после переезда — свежие, как раньше
+            text = _fill(text, {k: [r["text"] for r in kept if r["kind"] == k]
+                                for k in memory.NOTE_KINDS.values()}, keep=5)
     except Exception:
         logger.warning("не прочитать заметки чата %s", chat_id, exc_info=True)
         return ""
@@ -193,7 +203,7 @@ async def _general(chat_id: int) -> str:
     from . import history as store
     text, covered = await store.summary_get(chat_id)
     if f"{_SECTIONS[0]}:" not in text:
-        return text
+        return await _lift_old(chat_id, text, covered)
     general, people = _split(_trim_people(_normalize(text)))
     said = [ln.text for ln in await store.tail(chat_id, store.KEEP)]
     people = _junk(people, said)
@@ -204,7 +214,79 @@ async def _general(chat_id: int) -> str:
     await store.summary_set(chat_id, general, covered)
     logger.info("заметки чата %s: %d человек переехали в память о людях",
                 chat_id, len(people))
-    return general
+    return await _lift_old(chat_id, general, covered)
+
+
+def _lift(text: str) -> tuple[str, list[tuple[str, str]]]:
+    """Вынуть строки разделов, что живут в долгой памяти (memory.NOTE_KINDS).
+
+    Заголовки остаются с прочерком: следующая пересборка видит все пять
+    разделов и возвращает все пять — иначе _defect браковал бы её.
+    """
+    from . import memory
+    out, items, kind = [], [], None
+    for line in text.splitlines():
+        head = line.strip().rstrip(":")
+        if head in _SECTIONS:
+            kind = memory.NOTE_KINDS.get(head)
+            out.append(line)
+            if kind:
+                out.append("—")
+        elif kind:
+            if line.strip().strip("—–- ."):
+                items.append((kind, line))
+        else:
+            out.append(line)
+    return "\n".join(out), items
+
+
+def _fill(text: str, by_kind: dict[str, list[str]], keep: int = 0) -> str:
+    """Подставить в разделы памяти выбранные строки; раздел без строк — убрать.
+
+    keep — оставить и собственные строки раздела, добрав из by_kind до стольких.
+    """
+    from . import memory
+    out, kind, own = [], None, []
+
+    def flush():
+        lines = own + [f"— {t}" for t in by_kind.get(kind, [])] if keep else \
+            [f"— {t}" for t in by_kind.get(kind, [])]
+        lines = lines[:keep] if keep else lines
+        if lines:
+            out.append(f"{head_line}")
+            out.extend(lines)
+
+    head_line = ""
+    for line in text.splitlines():
+        head = line.strip().rstrip(":")
+        if head in _SECTIONS:
+            if kind:
+                flush()
+            kind, own, head_line = memory.NOTE_KINDS.get(head), [], line
+            if not kind:
+                out.append(line)
+        elif kind:
+            if line.strip().strip("—–- ."):
+                own.append(line)
+        else:
+            out.append(line)
+    if kind:
+        flush()
+    return "\n".join(out)
+
+
+async def _lift_old(chat_id: int, text: str, covered: int) -> str:
+    """Заметки, записанные до долгой памяти: их договорённости и шутки — туда."""
+    from . import history as store, memory
+    if not memory.notes_on():
+        return text
+    rest, items = _lift(text)
+    if rest == text:
+        return text
+    await memory.keep_notes(chat_id, items, await store.summary_updated(chat_id))
+    await store.summary_set(chat_id, rest, covered)
+    logger.info("заметки чата %s: %d строк переехали в долгую память", chat_id, len(items))
+    return rest
 
 
 async def clear(chat_id: int) -> bool:
@@ -313,6 +395,12 @@ def _normalize(text: str) -> str:
 # начинала переписывать переписку.
 _MEDIA = re.compile(r"\[(фото|стикер|гифка|видео|кружок|голосовое)")
 _RAW_LINE = re.compile(r"^@\S+:\s")
+# Голое вложение без подписи: «[стикер 🙂]», «[гифка]». Пересказывать в нём
+# нечего, а сборщик честно заводил на каждого любителя стикеров строку
+# «— @ник — [стикер 🙂]», и проверка на метки вложений браковала пересборку
+# целиком. У Яни, где полчата шлёт стикеры, так отклонялись 6 пересборок из
+# 8 и память о людях стояла пустой; без голых вложений — 1 из 8.
+_BARE = re.compile(r"^\s*\[[^\]]*\]\s*$")
 
 
 def _fit(text: str, limit: int) -> str:
@@ -467,6 +555,20 @@ def _norm(text: str) -> str:
     return re.sub(r"(\w)\1+", r"\1", re.sub(r" +", " ", text)).strip()
 
 
+# Образец строки из задания модель переписывала в запись: «— @ник — чем
+# занят, что о нём известно, как разговаривает. (Смешливый, …)» — у семи
+# человек одной пересборки. Образец вырезаем, описание после него оставляем.
+_TEMPLATE = re.compile(r"чем занят\w*,?\s*что о н[её]м известно,?\s*"
+                       r"как (он[аи]? )?разговарива\w*[.:,]?\s*", re.IGNORECASE)
+
+
+def _untemplate(desc: str) -> str:
+    out = _TEMPLATE.sub("", desc).strip(" .,;—-")
+    if out.startswith("("):
+        out = out[1:].rstrip(")").strip()
+    return out
+
+
 def _junk(people, said=()) -> list[tuple[str, str]]:
     """Выкинуть записи, которые описанием не являются.
 
@@ -475,6 +577,7 @@ def _junk(people, said=()) -> list[tuple[str, str]]:
     - Дословная реплика из чата вместо пересказа.
     - Метка вложения: «[фото]» — это цитата, а не описание.
     """
+    people = [(w, d) for w, d in ((w, _untemplate(d)) for w, d in people) if d]
     said = [_norm(t) for t in said]
     count: dict[str, int] = {}
     for _, desc in people:
@@ -506,6 +609,176 @@ def _junk(people, said=()) -> list[tuple[str, str]]:
     return out
 
 
+# Общие слова описаний: они есть у всех и ничего не говорят о том, чьё это.
+# Сверяем по основам — первым пяти буквам: «грибы», «грибам», «грибов» одно.
+_GENERIC = frozenset("""
+актив комме испол стике обсуж выраж интер говор делит участ сейча также часто
+любит прояв задаё задае вопро сообщ мнени фразы фраза эмоци отпра публи фотог
+гифки гифку гифка реаги шутит шутки предл расск упоми счита своих своей своег
+очень котор когда этого чтобы тобой тебя бота ботом боту себя новые прозв
+назыв прошл челов людей тему темы отвеч пишет коротк ответ манер сарка груст
+смешн абсур замеч соглаш други разно разны какие каких всего много иногда
+тоже пытае стара хочет может будет было была были нрави разго общае общен
+чате чатом чата видео фото стикеры спраш проси готов подум думае отмеч
+описы жалуе смеет смотр слуша читае предпо увлек призн объяс хвали ругае
+крити поддер согла соглас отказ""".split())
+_WORD = re.compile(r"[а-яёa-z]{4,}")
+
+
+def _stems(text: str) -> set[str]:
+    # ники не в счёт: «критикует @vasya» — про того, кто критикует
+    text = _MENTION.sub(" ", text)
+    return {w[:5] for w in _WORD.findall(text.lower().replace("ё", "е"))} - _GENERIC
+
+
+# Кусок описания, который продолжает предыдущий: «задаёт вопросы о том,
+# как…» — резать по запятой здесь нельзя, иначе от строки останется обрывок.
+_TAIL = re.compile(r"^(как|что|чтобы|где|куда|когда|котор\w*|почему|зачем|если|"
+                   r"особенно|и|а|но|или|либо|хотя|потому|так как)\b", re.IGNORECASE)
+
+
+def _pieces(part: str) -> list[str]:
+    """Куски одной части описания: по запятой и точке, придаточные — с главным."""
+    out = []
+    for p in re.split(r"(?<=[,.])\s+", part.strip()):
+        if out and (_TAIL.match(p) or not p.strip()):
+            out[-1] += " " + p
+        elif p.strip():
+            out.append(p)
+    return out
+
+
+def _evidence(rows) -> dict[str, set[str]]:
+    """Ключ человека -> основы из его реплик и из реплик о нём.
+
+    О человеке — это реплай на него или его @ник в тексте: «@вася вчера
+    уехал в Питер» — тоже правда о Васе, хоть и сказана не им. И вопрос, на
+    который он коротко ответил: «ты стоматолог?» — «Йеп».
+    """
+    from . import ai, history as store
+    owner = {line.msg_id: line.who for line in rows if line.msg_id}
+    ev: dict[str, set[str]] = {}
+    prev = None
+    for line in rows:
+        if line.who == ai.SELF:
+            prev = None
+            continue
+        st = _stems(line.text)
+        mine = ev.setdefault(store.person_key(line.who), set())
+        mine.update(st)
+        if prev is not None and prev.who != line.who and len(line.text.split()) <= 3:
+            mine.update(_stems(prev.text))
+        prev = line
+        for m in _MENTION.findall(line.text):
+            ev.setdefault(store.person_key(m), set()).update(st)
+        to = owner.get(line.reply_to)
+        if to and to not in (line.who, ai.SELF):
+            ev.setdefault(store.person_key(to), set()).update(st)
+    return ev
+
+
+def _stranger(key: str, piece: str, ev, before, skip=frozenset()) -> bool:
+    """Взят ли кусок описания из чужих реплик или чужой старой записи.
+
+    Чужим считаем только то, у чего у самого человека опоры нет вовсе, а у
+    другого есть. Когда тему обсуждали оба, кусок остаётся: про Японию могли
+    говорить двое, и у каждого она своя.
+    """
+    s = _stems(piece) - skip
+    if not s or s & ev.get(key, set()):
+        return False
+    mine = before.get(key, "")
+    if mine and len(s & _stems(mine)) * 2 >= len(s):
+        return False                   # перенесено из его же прошлой записи
+    if any(len(s & st) for k, st in ev.items() if k != key):
+        return True
+    return len(s) >= 2 and any(len(s & _stems(d)) * 2 >= len(s)
+                               for k, d in before.items() if k != key)
+
+
+def _owned(people, rows, before=None) -> list[tuple[str, str]]:
+    """Оставить в описании человека только то, что про него.
+
+    Сборщик пишет всех людей одним заходом и путает строки: история про
+    тараканов в общаге доставалась соседке по разговору, вопрос «как ты
+    относишься к красным грибам» — тому, кто его не задавал, а описание
+    одного человека целиком переезжало к другому из прошлых заметок. На
+    живой переписке так уходил примерно каждый тридцатый кусок описания.
+
+    Сверяем каждый кусок (через «; », запятую или точку) с репликами этого
+    человека и с его прошлой записью. Чужое вырезаем, своё оставляем.
+    before — прошлые записи тех, кто в пачке: ключ -> описание.
+    """
+    from . import history as store
+    ev = _evidence(rows)
+    before = {store.person_key(k): v for k, v in (before or {}).items()}
+    # ники без собаки — «смеётся над BlackRabbit6951» — тоже не в счёт
+    skip = set()
+    for line in rows:
+        skip |= _stems(line.who.lstrip("@").replace("_", " "))
+    out = []
+    for who, desc in people:
+        key = store.person_key(who)
+        parts, gone = [], []
+        for part in desc.split("; "):
+            keep = []
+            for p in _pieces(part):
+                (gone if _stranger(key, p, ev, before, skip) else keep).append(p)
+            if keep:
+                parts.append(" ".join(keep).rstrip(" ,"))
+        if gone:
+            logger.info("заметки: у %s вырезано чужое: %s", who, " | ".join(gone))
+        if parts:
+            out.append((who, "; ".join(parts) if gone else desc))
+    return out
+
+
+async def recall(chat_id: int, who: str, text: str, self_names=()) -> str:
+    """Что бот помнит о собеседнике — и только то, что к его реплике.
+
+    Запись о человеке и так лежит в справке системного промпта, но там она
+    одна из восьми и модель её почти не замечает. Здесь берём из записи
+    куски, совпадающие с репликой по словам, и кладём в само задание.
+    Не больше двух и только по совпадению: всё подряд модель тащила бы в
+    каждый ответ, как Холо — яблоки.
+    """
+    from . import history as store
+    try:
+        known = await store.people_get(chat_id, [who])
+    except Exception:
+        logger.warning("не прочитать запись %s в чате %s", who, chat_id, exc_info=True)
+        return ""
+    if not known:
+        return ""
+    mine = set()
+    for n in self_names:
+        mine |= _stems(n)
+    asked = _stems(text) - mine
+    pieces = [p.strip(" ,.") for part in known[0][1].split("; ") for p in _pieces(part)
+              if len(p) <= 200]
+    hits = [p for p in pieces if (_stems(p) - mine) & asked][:2]
+    # По словам находится половина: «ноги ледяные» с «холодными конечностями»
+    # общих слов не имеют. Остальное — по смыслу (memory.py).
+    if len(hits) < 2:
+        from . import memory
+        if memory.enabled():
+            try:
+                everyone = await store.people_all(chat_id)
+                pool = [p.strip(" ,.") for _, d in everyone
+                        for part in d.split("; ") for p in _pieces(part)]
+                hits += await memory.closest(text, [p for p in pieces if p not in hits],
+                                             pool, 2 - len(hits))
+            except Exception:
+                logger.warning("память: подбор по смыслу сорвался", exc_info=True)
+    if not hits:
+        return ""
+    # Формулировку мерили. С хвостом «если к месту — опирайся на это» факт
+    # всплывал в 2 ответах из 39, а сам хвост протекал в реплику: «Опирайся
+    # на свой опыт, юнец!». Сухая справка без указаний — 5 из 15: «Ох,
+    # курьерские муки!» вместо общего «бедняжка».
+    return f"Что ты знаешь о собеседнике: {who} — {'; '.join(hits)}."
+
+
 # «— Бот: Миша – это аномалия.» — сборщик кладёт в заметки реплики самого бота.
 # Из заметок они возвращаются в каждый ответ: в живом чате «аномалия» и
 # «дефект» полезли в ответы на что угодно, а бот стал говорить шаблонами.
@@ -526,8 +799,17 @@ def _drop_own(text: str, own=()) -> str:
         body = _norm(line.lstrip(" —–-")) if line.lstrip().startswith("—") else ""
         if own and len(body) >= 8 and any(o in body or body in o for o in own):
             continue
+        # Цитата бота внутри строки: «Бот предлагает расслабиться (“Ёпта,
+        # пизда! Да брось ты…”)». Из заметок она шла в каждый ответ, и Яни
+        # открывала ею три ответа из семи.
+        quotes = [_norm(q) for q in _QUOTED.findall(line)]
+        if own and any(len(q) >= 8 and any(q in o or o in q for o in own) for q in quotes):
+            continue
         keep.append(line)
     return "\n".join(keep)
+
+
+_QUOTED = re.compile(r"[«“\"]([^»”\"]{6,})[»”\"]")
 
 
 def _defect(text: str) -> str:
@@ -559,7 +841,7 @@ def _defect(text: str) -> str:
     return ""
 
 async def _compact(chat_id: int) -> None:
-    from . import ai, history as store
+    from . import ai, db, history as store
     # Неудача обнуляет счётчик, успех — пересчитывает его по базе. Обнулять
     # заранее нельзя: сорвавшийся запрос терял бы восемь десятков реплик,
     # а не обнулять после неудачи — значит дёргать модель на каждом
@@ -577,6 +859,12 @@ async def _compact(chat_id: int) -> None:
             ok = True
             return
         last_id = rows[-1][0]
+        rows = [(i, line) for i, line in rows if not _BARE.match(line.text)]
+        if not rows:
+            # одни стикеры: пересказывать нечего, но отметку двигаем
+            await store.summary_set(chat_id, old, last_id)
+            ok = True
+            return
         # Реплики бота подписываем «бот», а не «ты»: «ты» сборщик относит к себе
         # и приписывал боту чужие черты — «ты чинишь проигрыватель», «у тебя
         # депрессия из-за преподавателя».
@@ -606,7 +894,10 @@ async def _compact(chat_id: int) -> None:
               f"<chat>\n{fresh}\n</chat>\n\n"
               "Верни обновлённые заметки целиком."
         )
-        text = await ai.raw(_SYSTEM, question, config.AI_SUMMARY_TOKENS)
+        # Заметки — на модели ответов: gemma3:12b писала их так же криво
+        # («наивная и глупая» — это она сказала боту), а шла 400 с против 13.
+        with ai.patient(config.AI_SUMMARY_TIMEOUT):
+            text = await ai.raw(_SYSTEM, question, config.AI_SUMMARY_TOKENS)
         text = ai.strip_thoughts(text).strip()
         if not text:
             logger.info("заметки чата %s: модель вернула пустоту", chat_id)
@@ -625,14 +916,36 @@ async def _compact(chat_id: int) -> None:
         people = [(names[store.person_key(w)], d) for w, d in people
                   if store.person_key(w) in names and not ai.taboo(d)]
         people = _junk(people, [line.text for _, line in rows])
-        general = _drop_own(general, [line.text for _, line in rows
+        people = _owned(people, [line for _, line in rows], dict(known))
+        # свои реплики — не только из пачки: старые цитаты бота живут в
+        # прошлых заметках и переезжают из пересборки в пересборку
+        said = [ln.text for ln in await ai.history(chat_id, config.AI_HISTORY)
+                if ln.who == ai.SELF]
+        general = _drop_own(general, said + [line.text for _, line in rows
                                       if line.who == ai.SELF])
+        from . import memory
+        if memory.notes_on():
+            # договорённости и шутки копятся в долгой памяти, а не
+            # переписываются: в заметках им пять строк, и лишнее выпадало
+            general, items = _lift(general)
+            await memory.keep_notes(chat_id, items,
+                                    max((getattr(ln, "ts", 0) or 0) for _, ln in rows) or None)
         general = _fit(general, config.AI_SUMMARY_LIMIT)
         await store.people_set(chat_id, people)
         await store.summary_set(chat_id, general, last_id)
         ok = True
         logger.info("заметки чата %s пересобраны по %d репликам: %d знаков, "
                     "людей обновлено %d", chat_id, len(rows), len(general), len(people))
+        # события из той же пачки — в журнал долгой памяти (memory.py)
+        s = await db.get_settings(chat_id)
+        if getattr(s, "ai_journal", 1):
+            from . import memory
+            try:
+                with ai.patient(config.AI_SUMMARY_TIMEOUT), ai.collecting():
+                    await memory.journal(chat_id, [line for _, line in rows],
+                                         ai.plain_names(s))
+            except Exception:
+                logger.warning("память: журнал чата %s не записан", chat_id, exc_info=True)
     except Exception:
         logger.warning("не пересобрать заметки чата %s", chat_id, exc_info=True)
     finally:

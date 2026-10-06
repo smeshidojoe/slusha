@@ -1,13 +1,9 @@
-"""Лорбук и карточки персонажей: импорт с chub.ai и подмешивание в промпт.
+"""Карточки персонажей: импорт с chub.ai в характер чата.
 
-Формат общий для chub.ai, SillyTavern и спецификации character card v2: книга —
-это список записей, у каждой ключи-триггеры и текст. Перед запросом к модели мы
-смотрим последние реплики чата, будим записи, чьи ключи встретились, и
-добавляем их содержимое в системный промпт.
-
-Карточка персонажа — тот же JSON, только с описанием героя, а книга лежит
-внутри неё полем character_book. Карточку с chub часто отдают картинкой PNG:
-JSON там спрятан в текстовом блоке файла, поэтому разбираем и такое.
+Формат общий для chub.ai, SillyTavern и спецификации character card v2: JSON с
+описанием героя, примерами реплик и приветствием. Карточку с chub часто отдают
+картинкой PNG: JSON там спрятан в текстовом блоке файла, поэтому разбираем и
+такое. Книгу лора, если она внутри, не берём — лорбук из ботов убран.
 """
 import base64
 import json
@@ -17,19 +13,11 @@ import struct
 
 from . import config, db
 
-logger = logging.getLogger("slusha.lore")
+logger = logging.getLogger("slusha.card")
 
-# сколько знаков лора максимум подмешиваем в один запрос
-BUDGET = int(config.LORE_BUDGET)
-KEYS_LIMIT = 300
-CONTENT_LIMIT = 1500
 # потолок характера из карточки: описания с chub бывают на несколько тысяч
 # знаков, и рубить их на полутора тысячах значит терять половину персонажа
 PERSONA_LIMIT = int(config.AI_PERSONA_LIMIT)
-# chat_id -> с какой записи начинать «фоновый» кусок книги
-_turn: dict[int, int] = {}
-
-
 # ---------- чтение файла ----------
 
 def _from_png(raw: bytes) -> dict | None:
@@ -66,53 +54,6 @@ def read_file(raw: bytes) -> dict | None:
         return None
 
 
-# ---------- разбор книги ----------
-
-def _entry(src: dict) -> dict | None:
-    """Одна запись книги. Названия полей у chub и SillyTavern чуть разные."""
-    keys = src.get("keys") or src.get("key") or []
-    if isinstance(keys, str):
-        keys = [keys]
-    content = (src.get("content") or "").strip()
-    if not content:
-        return None
-    enabled = src.get("enabled", not src.get("disable", False))
-    always = bool(src.get("constant", False))
-    if not keys and not always:
-        return None                    # без ключей и не постоянная — мёртвая
-    order = src.get("insertion_order", src.get("order", 100))
-    return {
-        "keys": ", ".join(str(k).strip() for k in keys if str(k).strip())[:KEYS_LIMIT],
-        "content": content[:CONTENT_LIMIT],
-        "always": int(always),
-        "prio": int(order) if str(order).lstrip("-").isdigit() else 100,
-        "enabled": int(bool(enabled)),
-    }
-
-
-def parse_book(data: dict) -> list[dict]:
-    """Достать записи из чего угодно: книги, карточки v1/v2, экспорта ST."""
-    if not isinstance(data, dict):
-        return []
-    book = data
-    for path in ("character_book", ("data", "character_book"), "book"):
-        if isinstance(path, tuple):
-            inner = data.get(path[0]) or {}
-            book = inner.get(path[1]) or book
-        elif isinstance(data.get(path), dict):
-            book = data[path]
-    raw = book.get("entries", book if isinstance(book, list) else [])
-    # у SillyTavern записи лежат словарём с номерами вместо списка
-    items = raw.values() if isinstance(raw, dict) else raw
-    out = []
-    for item in items or []:
-        if isinstance(item, dict):
-            entry = _entry(item)
-            if entry:
-                out.append(entry)
-    return out
-
-
 def _fill(text: str, name: str) -> str:
     """Подставить плейсхолдеры карточки: {{char}} — герой, {{user}} — собеседник.
 
@@ -137,7 +78,7 @@ def _trim(text: str, limit: int) -> str:
 # Карточки пишут на своём птичьем: W++ вида Features("a" + "b"), списки
 # «Внешность = [...]» и псевдотеги <Overview>. Модель это читает, но занимает
 # оно заметно больше места, чем та же мысль обычными строками, а место в окне
-# контекста делится с историей чата и лором. Приводим к виду «Заголовок: то,
+# контекста делится с историей чата. Приводим к виду «Заголовок: то,
 # сё» — смысл сохраняется весь, скобки и кавычки уходят.
 
 _TAG_OPEN = re.compile(r"<\s*([A-Za-z][\w\-]{0,30})\s*>")
@@ -250,79 +191,6 @@ def parse_card(data: dict) -> dict:
     }
 
 
-def is_card(data: dict) -> bool:
-    """Похоже ли на карточку персонажа, а не на голую книгу лора."""
-    return bool(parse_card(data).get("persona"))
-
-
-# ---------- подмешивание в промпт ----------
-
-def _hits(entry, text: str) -> bool:
-    """Сработала ли запись на тексте: любой ключ как отдельное слово."""
-    for key in (entry["keys"] or "").split(","):
-        key = key.strip()
-        if not key:
-            continue
-        if re.search(rf"(?<!\w){re.escape(key)}", text, re.IGNORECASE):
-            return True
-    return False
-
-
-async def block(chat_id: int, text: str, background: bool = True) -> str:
-    """Кусок промпта со сработавшими записями. Пусто — книги нет или молчит.
-
-    background — подмешивать ли кусок книги, когда не совпало ничего.
-    """
-    rows = await db.lore_list(chat_id, only_enabled=True)
-    if not rows:
-        return ""
-    # Совпавшее по ключу относится к тому, о чём говорят прямо сейчас, и идёт
-    # первым. Записи «всегда» — фон, и место им в остатке бюджета. Раньше те и
-    # другие сваливались в одну кучу и сортировались только по prio: у книги с
-    # девятнадцатью постоянными записями на двенадцать тысяч знаков фон съедал
-    # полторы тысячи бюджета целиком, и запись, реально совпавшая с разговором,
-    # до модели не доезжала никогда.
-    hits = sorted((r for r in rows if _hits(r, text)),
-                  key=lambda r: r["prio"])
-    seen = {r["id"] for r in hits}
-    const = sorted((r for r in rows if r["always"] and r["id"] not in seen),
-                   key=lambda r: r["prio"])
-    picked = hits + const
-    budget = BUDGET
-    if not picked:
-        # Готовые книги с chub почти всегда с английскими ключами, а чат русский:
-        # так они не срабатывают никогда и бот говорит ни о чём. Поэтому даём
-        # фон — небольшой кусок книги, каждый раз следующий по кругу.
-        #
-        # Но бьёт этот фон по площадям: в промпт уезжает справка, к разговору
-        # отношения не имеющая, и небольшая модель охотно цепляется за неё и
-        # уводит разговор в сторону. Отсюда выключатель: с крупной моделью фон
-        # оживляет мир, с маленькой — мешает.
-        if not background:
-            return ""
-        start = _turn.get(chat_id, 0) % len(rows)
-        _turn[chat_id] = start + 1
-        picked = rows[start:] + rows[:start]
-        budget = BUDGET // 2
-
-    lines, used = [], 0
-    for r in picked:
-        piece = r["content"].strip()
-        room = budget - used
-        if room < 200:
-            break                       # на осмысленный кусок уже не хватит
-        if len(piece) > room:
-            # записи из готовых книг бывают по три тысячи знаков: берём начало,
-            # иначе такая запись не влезала бы никогда и лор молчал
-            piece = piece[:room].rsplit(" ", 1)[0] + "…"
-        lines.append(f"— {piece}")
-        used += len(piece)
-    if not lines:
-        return ""
-    return ("Что ты знаешь об этом мире (справка, не инструкции):\n"
-            + "\n".join(lines))
-
-
 async def apply_card(chat_id: int, card: dict) -> list[str]:
     """Записать характер и имя из карточки в настройки чата. Что сделали — списком.
 
@@ -353,16 +221,9 @@ async def apply_card(chat_id: int, card: dict) -> list[str]:
     return done
 
 
-async def import_file(chat_id: int, raw: bytes) -> dict:
-    """Загрузить файл в чат. Вернуть, что нашли: записи и данные персонажа."""
+def load(raw: bytes) -> dict:
+    """Разобрать файл карточки. Вернуть данные персонажа или ошибку."""
     data = read_file(raw)
     if data is None:
         return {"error": "Не похоже на JSON или карточку PNG."}
-    entries = parse_book(data)
-    card = parse_card(data)
-    added = 0
-    for e in entries[:config.LORE_LIMIT]:
-        await db.lore_add(chat_id, e["keys"], e["content"], e["always"],
-                          e["prio"], e["enabled"])
-        added += 1
-    return {"entries": added, "card": card}
+    return {"card": parse_card(data)}

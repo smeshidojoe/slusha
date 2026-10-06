@@ -12,7 +12,7 @@ os.environ.update(SLUSHA_BOT_TOKEN="1:x", SLUSHA_ADMIN_IDS="424211817",
 sys.path.insert(0, os.path.dirname(os.path.dirname(
     os.path.dirname(os.path.abspath(__file__)))))
 
-from slusha import ai, config, db, history, lore, menu, schema   # noqa: E402
+from slusha import ai, config, db, card as cards, history, menu, schema   # noqa: E402
 
 OWNER = 424211817
 CID = -1001234567890
@@ -58,7 +58,6 @@ async def main():
     for name, coro in (("home", menu.view_home(OWNER)),
                        ("chats", menu.view_chats(bot, OWNER)),
                        ("chat", menu.view_chat(CID)),
-                       ("lore", menu.view_lore(CID)),
                        ("access", menu.view_access())):
         text, kb = await coro
         check(f"экран {name}", bool(text) and kb is not None)
@@ -66,9 +65,9 @@ async def main():
     # карточка персонажа
     if os.path.exists(CARD):
         raw = open(CARD, "rb").read()
-        result = await lore.import_file(CID, raw)
+        result = cards.load(raw)
         card = result["card"]
-        done = await lore.apply_card(CID, card)
+        done = await cards.apply_card(CID, card)
         s = await db.get_settings(CID)
         check("характер из карточки", len(s.ai_persona or "") > 3000)
         check("имя в обращениях", "belisarius" in (s.ai_names or ""))
@@ -80,12 +79,6 @@ async def main():
     prompt = ai._prompt(s, "Овощехранилище", "@mike", ["@slusha_bot", "Слюша"])
     check("в промпте правило про русский", "по-русски" in prompt)
     check("в промпте характер", "Cawl" in prompt or "Слюша" in prompt)
-
-    # лор подмешивается даже без совпадения ключей
-    await db.lore_add(CID, "mars", "Марс — кузница Механикус." * 20)
-    block = await lore.block(CID, "привет как дела")
-    check("фоновый лор подмешался", bool(block))
-    check("лор влез в бюджет", len(block) <= config.LORE_BUDGET + 200)
 
     # лимит ответов в сутки
     spent = await ai.spent_today(CID)

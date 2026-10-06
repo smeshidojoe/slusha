@@ -80,12 +80,18 @@ async def main() -> None:
         from .web import server as web_server
         web_runner = await web_server.start(bot)
 
+    # долгая память: ночная уборка дневника и выгрузка в Obsidian (memory.py)
+    from . import memory
+    nightly = asyncio.create_task(memory.nightly()) if memory.enabled() else None
+
     try:
         # список апдейтов собирается по зарегистрированным хендлерам: реакции
         # (message_reaction) попадают в него только благодаря хендлеру в group
         await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types(),
                                drop_pending_updates=True)
     finally:
+        if nightly is not None:
+            nightly.cancel()
         if web_runner is not None:
             from .web import server as web_server
             await web_server.stop(web_runner)
