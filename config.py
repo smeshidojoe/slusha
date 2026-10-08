@@ -144,6 +144,19 @@ AI_RANDOM_PRESETS = (0, 1, 3, 5, 10, 20, 50, 100)
 AI_REPLY_PRESETS = (0, 50, 100)
 AI_REPLY_LABELS = {0: "молчит", 50: "решает сам", 100: "всегда"}
 
+# Заговаривать первым (initiative.py): про созревший план человека.
+# 1 — когда человек сам появится в чате, 2 — ещё и сам напишет, если не появился.
+AI_INITIATIVE_PRESETS = (0, 1, 2)
+AI_INITIATIVE_LABELS = {0: "никогда", 1: "когда человек появится",
+                        2: "и сам напишет в чат"}
+# своих реплик в сутки на чат, сверх обычного лимита ответов не идут
+AI_INITIATIVE_DAILY = int(os.getenv("AI_INITIATIVE_DAILY") or 1)
+# в какие часы по Москве бот пишет в чат сам
+AI_INITIATIVE_HOURS = (int(os.getenv("AI_INITIATIVE_FROM") or 12),
+                       int(os.getenv("AI_INITIATIVE_TO") or 22))
+# сколько часов после созревания плана ждать, что человек появится сам
+AI_INITIATIVE_WAIT = int(os.getenv("AI_INITIATIVE_WAIT") or 18) * 3600
+
 
 def _each(n: int) -> str:
     tail = ("сообщение" if n % 10 == 1 and n % 100 != 11 else

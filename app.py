@@ -83,6 +83,9 @@ async def main() -> None:
     # долгая память: ночная уборка дневника и выгрузка в Obsidian (memory.py)
     from . import memory
     nightly = asyncio.create_task(memory.nightly()) if memory.enabled() else None
+    # бот сам спрашивает про созревшие планы (initiative.py)
+    from . import initiative
+    nudges = asyncio.create_task(initiative.loop(bot))
 
     try:
         # список апдейтов собирается по зарегистрированным хендлерам: реакции
@@ -90,6 +93,7 @@ async def main() -> None:
         await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types(),
                                drop_pending_updates=True)
     finally:
+        nudges.cancel()
         if nightly is not None:
             nightly.cancel()
         if web_runner is not None:

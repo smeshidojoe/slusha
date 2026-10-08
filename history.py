@@ -171,6 +171,14 @@ async def _migrate(db: aiosqlite.Connection) -> None:
             continue
         await db.execute(f"ALTER TABLE ai_history ADD COLUMN {name} {decl}")
         logger.info("переписка: добавлена колонка %s", name)
+    # план: на какое сообщение ответить, когда бот спросит о нём сам
+    cur = await db.execute("PRAGMA table_info(ai_plans)")
+    have = {r["name"] for r in await cur.fetchall()}
+    # и готовая реплика-вопрос: NULL — ещё не написана, '' — не вышло
+    for name, decl in (("msg_id", "INTEGER"), ("thread_id", "INTEGER"), ("opener", "TEXT")):
+        if name not in have:
+            await db.execute(f"ALTER TABLE ai_plans ADD COLUMN {name} {decl}")
+            logger.info("переписка: добавлена колонка ai_plans.%s", name)
     await db.executescript(_AFTER_MIGRATE)
     await db.commit()
 
@@ -504,15 +512,17 @@ async def mood_all(chat_id: int) -> dict[str, tuple[float, float, int, str]]:
 # ---------- незакрытые темы ----------
 
 async def plan_add(chat_id: int, who: str, text: str, ts: int,
-                   ask_from: int, ask_to: int, keep: int) -> None:
+                   ask_from: int, ask_to: int, keep: int,
+                   msg_id: int | None = None, thread_id: int | None = None) -> None:
     """Запомнить план. У человека держим keep самых свежих, отжившие — стираем."""
     db = await _conn()
     key = person_key(who)
     await db.execute("DELETE FROM ai_plans WHERE ask_to < ?", (ts,))
     await db.execute(
-        """INSERT INTO ai_plans (chat_id, key, who, text, ts, ask_from, ask_to)
-           VALUES (?,?,?,?,?,?,?)""",
-        (chat_id, key, who, text, ts, ask_from, ask_to))
+        """INSERT INTO ai_plans (chat_id, key, who, text, ts, ask_from, ask_to,
+                                 msg_id, thread_id)
+           VALUES (?,?,?,?,?,?,?,?,?)""",
+        (chat_id, key, who, text, ts, ask_from, ask_to, msg_id, thread_id))
     await db.execute(
         """DELETE FROM ai_plans WHERE chat_id = ? AND key = ? AND id NOT IN
                (SELECT id FROM ai_plans WHERE chat_id = ? AND key = ?
@@ -529,6 +539,40 @@ async def plans_due(chat_id: int, who: str, now: int) -> list[tuple[int, str, in
            AND ask_from <= ? AND ask_to >= ? ORDER BY ts""",
         (chat_id, person_key(who), now, now))
     return [(r["id"], r["text"], r["ts"]) for r in await cur.fetchall()]
+
+
+async def plans_ripe(chat_id: int, now: int, wait: int = 0,
+                     who: str | None = None) -> list[dict]:
+    """Не спрошенные планы чата с готовой репликой, созревшие wait секунд назад.
+
+    who — только этого человека.
+    """
+    db = await _conn()
+    sql = ("""SELECT id, who, text, ts, ask_to, msg_id, thread_id, opener FROM ai_plans
+              WHERE chat_id = ? AND done = 0 AND ask_from + ? <= ? AND ask_to >= ?
+              AND opener IS NOT NULL AND opener != ''""")
+    args = [chat_id, wait, now, now]
+    if who is not None:
+        sql += " AND key = ?"
+        args.append(person_key(who))
+    cur = await db.execute(sql + " ORDER BY ask_to", args)
+    return [dict(r) for r in await cur.fetchall()]
+
+
+async def plans_unwritten(chat_id: int, until: int, now: int) -> list[dict]:
+    """Планы, которые созреют к until, а реплики-вопроса к ним ещё нет."""
+    db = await _conn()
+    cur = await db.execute(
+        """SELECT id, who, text, ts FROM ai_plans WHERE chat_id = ? AND done = 0
+           AND opener IS NULL AND ask_from <= ? AND ask_to >= ? ORDER BY ask_from""",
+        (chat_id, until, now))
+    return [dict(r) for r in await cur.fetchall()]
+
+
+async def plan_opener(plan_id: int, text: str) -> None:
+    db = await _conn()
+    await db.execute("UPDATE ai_plans SET opener = ? WHERE id = ?", (text, plan_id))
+    await db.commit()
 
 
 async def plans_open(chat_id: int) -> list[tuple[str, str, int]]:

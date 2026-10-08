@@ -42,7 +42,9 @@ _WHEN = re.compile(r"""(?ix)
 """)
 # Первое лицо, будущее или «у меня …»: план говорящего, а не новость о мире.
 _MINE = re.compile(r"""(?ix)
- \b(буду|будем|пойду|пойдём|пойдем|поеду|поедем|полечу|иду|идём|идем|еду|едем|лечу|летим
+ \b(буду|будем|пойду|пойдём|пойдем|поеду|поедем|полечу|иду|идём|идем|едем|лечу|летим
+   # «еду» — и «поеду», и пища: «скидываемся на еду … на выходных не ест»
+   |(?<!на\s)(?<!за\s)(?<!про\s)(?<!без\s)(?<!для\s)(?<!мою\s)(?<!всю\s)еду
    |сдаю|сдавать|сдам|сдаём|забираю|забирать|встречаюсь|собираюсь|планирую|переезжаю|уезжаю
    |улетаю|начинаю|выхожу|попробую|приготовлю|куплю|закажу|сделаю|доделаю|допишу)\b
  | \bу\s+меня\b | \bмне\s+(надо|нужно|предстоит)\b
@@ -92,15 +94,20 @@ def detect(text: str, ts: int) -> tuple[int, int] | None:
     return start - TZ, start - TZ + ASK_DAYS * 86400
 
 
-async def note(chat_id: int, who: str, text: str) -> None:
-    """Запомнить реплику, если это план со сроком."""
+async def note(chat_id: int, who: str, text: str, msg_id: int | None = None,
+               thread: int | None = None) -> None:
+    """Запомнить реплику, если это план со сроком.
+
+    msg_id и тема форума — чтобы спросить реплаем на сам план (initiative.py).
+    """
     from . import history as store
     ts = int(time.time())
     when = detect(text, ts)
     if not when:
         return
     try:
-        await store.plan_add(chat_id, who, text.strip(), ts, *when, PER_PERSON)
+        await store.plan_add(chat_id, who, text.strip(), ts, *when, PER_PERSON,
+                             msg_id, thread)
         logger.info("план %s в чате %s: %r", who, chat_id, text[:80])
     except Exception:
         logger.warning("не запомнить план %s в чате %s", who, chat_id, exc_info=True)
@@ -115,13 +122,21 @@ def _ago(ts: int, now: int) -> str:
     return f"{days} дня назад" if days < 5 else f"{days} дней назад"
 
 
+def told(who: str, text: str, ts: int, rows) -> bool:
+    """Человек уже сам рассказал, чем кончилось: его свежая реплика о том же."""
+    from . import summary
+    topic = summary._stems(text)
+    return any(ln.who == who and getattr(ln, "ts", 0) > ts and ln.text != text
+               and topic & summary._stems(ln.text) for ln in rows)
+
+
 async def line(chat_id: int, who: str, rows=()) -> str:
     """Строка для задания про созревший план человека. Пусто — спрашивать не о чем.
 
     Отдаём одну тему и сразу помечаем её спрошенной: второй раз бот о ней
     напоминать не будет, даже если в этот раз промолчал.
     """
-    from . import history as store, summary
+    from . import history as store
     now = int(time.time())
     try:
         due = await store.plans_due(chat_id, who, now)
@@ -131,10 +146,7 @@ async def line(chat_id: int, who: str, rows=()) -> str:
     for pid, text, ts in due:
         await store.plan_done(pid)
         # Уже рассказал сам: его свежая реплика о том же — переспрашивать глупо.
-        topic = summary._stems(text)
-        told = any(ln.who == who and getattr(ln, "ts", 0) > ts and ln.text != text
-                   and topic & summary._stems(ln.text) for ln in rows)
-        if told:
+        if told(who, text, ts, rows):
             continue
         return (f"{_ago(ts, now)} {who} писал: «{text[:200]}». "
                 "Если к месту — спроси, как прошло.")
