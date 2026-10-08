@@ -157,6 +157,16 @@ AI_INITIATIVE_HOURS = (int(os.getenv("AI_INITIATIVE_FROM") or 12),
 # сколько часов после созревания плана ждать, что человек появится сам
 AI_INITIATIVE_WAIT = int(os.getenv("AI_INITIATIVE_WAIT") or 18) * 3600
 
+# Реакции под сообщениями, на которые бот не ответил словами (emote.py).
+AI_REACT_PRESETS = (0, 1, 2)
+AI_REACT_LABELS = {0: "никогда", 1: "изредка", 2: "почаще"}
+# шанс в процентах: (на ответ боту, на прочие сообщения)
+AI_REACT_CHANCE = {1: (35, 3), 2: (70, 8)}
+# в общем разговоре — не чаще раза в столько секунд
+AI_REACT_GAP = int(os.getenv("AI_REACT_GAP") or 600)
+# реакций в сутки на чат
+AI_REACT_DAILY = int(os.getenv("AI_REACT_DAILY") or 20)
+
 
 def _each(n: int) -> str:
     tail = ("сообщение" if n % 10 == 1 and n % 100 != 11 else

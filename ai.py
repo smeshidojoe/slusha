@@ -2029,9 +2029,11 @@ async def maybe_reply(bot, message, s) -> None:
         if not await should_reply(bot, message, s):
             # Человек, чей план созрел, появился в чате — спросить его самим,
             # не дожидаясь, пока он обратится к боту (initiative.py).
+            # Иначе — может, хоть реакцию поставить (emote.py).
             if user is not None and not user.is_bot:
-                from . import initiative
-                await initiative.seen(bot, s, chat_id, who)
+                from . import emote, initiative
+                if not await initiative.seen(bot, s, chat_id, who):
+                    await emote.maybe(bot, message, s)
             return
 
     if not _ready(chat_id):

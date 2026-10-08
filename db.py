@@ -44,7 +44,8 @@ CREATE TABLE IF NOT EXISTS settings(
     ai_plans    INTEGER NOT NULL DEFAULT 1,
     ai_search   INTEGER NOT NULL DEFAULT 1,
     ai_journal  INTEGER NOT NULL DEFAULT 1,
-    ai_initiative INTEGER NOT NULL DEFAULT 2
+    ai_initiative INTEGER NOT NULL DEFAULT 2,
+    ai_react    INTEGER NOT NULL DEFAULT 1
 );
 CREATE TABLE IF NOT EXISTS access(
     id       INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -91,6 +92,8 @@ class Settings:
     ai_journal: int = 1
     # заговаривать первым про созревший план (initiative.py): 0 / 1 / 2
     ai_initiative: int = 2
+    # ставить реакции, где не ответил словами (emote.py): 0 / 1 / 2
+    ai_react: int = 1
 
 
 _FIELDS = {f.name for f in fields(Settings)} - {"chat_id"}
@@ -141,7 +144,8 @@ async def _migrate() -> None:
                        ("ai_plans", "INTEGER NOT NULL DEFAULT 1"),
                        ("ai_search", "INTEGER NOT NULL DEFAULT 1"),
                        ("ai_journal", "INTEGER NOT NULL DEFAULT 1"),
-                       ("ai_initiative", "INTEGER NOT NULL DEFAULT 2")):
+                       ("ai_initiative", "INTEGER NOT NULL DEFAULT 2"),
+                       ("ai_react", "INTEGER NOT NULL DEFAULT 1")):
         await _add_column("settings", name, decl)
     await _db.commit()
 
